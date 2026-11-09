@@ -1,0 +1,12 @@
+herdr-agent-resume, Windows port
+
+This is a derivative of https://github.com/thuanlm215/herdr-agent-resume
+(cloned at commit a62a3ee, "Fix session claim races and invalid labels (v0.4.1)"),
+Copyright (c) the original authors, released under the MIT License. The original
+LICENSE file is kept unchanged in this repository; the Windows changes are offered
+under the same MIT License.
+
+Windows changes: mods/agent-resume/winproc.py (new), Windows branches in
+mods/agent-resume/agent_resume.py, scripts/install.py, tests/test_windows.py,
+tests/test_install_windows.py, README.windows.md, docs/windows-test-report.md.
+The original Linux/macOS behaviour is kept; upstream's POSIX tests are skipped on Windows.

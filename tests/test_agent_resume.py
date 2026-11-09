@@ -4,10 +4,16 @@ import multiprocessing
 import os
 from io import StringIO
 from pathlib import Path
+import sys
 import tempfile
 import time
 import unittest
 from unittest import mock
+
+if sys.platform == "win32":
+    # Upstream's POSIX suite (fish/bash, /proc, fcntl, "/work" paths). The Windows port is
+    # covered by test_windows.py and test_install_windows.py.
+    raise unittest.SkipTest("POSIX-only suite; see test_windows.py")
 
 spec = importlib.util.spec_from_file_location("agent_resume", Path(__file__).parents[1] / "mods/agent-resume/agent_resume.py")
 ar = importlib.util.module_from_spec(spec)

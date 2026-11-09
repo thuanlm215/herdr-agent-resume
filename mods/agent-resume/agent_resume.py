@@ -35,16 +35,29 @@ import sys
 import time
 from urllib.parse import quote
 
+IS_WIN = sys.platform == "win32"
+if IS_WIN:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import winproc
+
 LABEL = "agent-resume"
-AGENTS = {
+ALL_AGENTS = {
     "claude": {"names": {"claude"}, "argv": lambda session: ["claude", "--resume", session]},
-    "codex": {"names": {"codex"}, "argv": lambda session: ["codex", "resume", session]},
+    # Windows: Herdr itself starts Codex as `codex --no-daemon`. Without it a resumed Codex
+    # joins another terminal's shared background server, and its SessionStart hook then runs
+    # under that terminal's identity (seen on a real install: the hook reported t13).
+    "codex": {"names": {"codex"}, "argv": lambda session: (["codex", "resume", "--no-daemon", session] if IS_WIN
+                                                           else ["codex", "resume", session])},
     "grok": {"names": {"grok"}, "argv": lambda session: ["grok", "--resume", session]},
     "agy": {"names": {"agy"}, "argv": lambda session: ["agy", "--conversation", session]},
     "pi": {"names": {"pi"}, "argv": lambda session: ["pi", "--session", session]},
     "kiro": {"names": {"kiro", "kiro-cli", "kiro-cli-chat"},
              "argv": lambda session: ["kiro-cli", "chat", "--v3", "--resume-id", session]},
 }
+# The Windows port resumes Claude Code and Codex only. The other agents keep their entries
+# in ALL_AGENTS so a tool launched by one of them still counts as "nested", not as a session.
+WINDOWS_AGENTS = ("claude", "codex")
+AGENTS = {name: spec for name, spec in ALL_AGENTS.items() if not IS_WIN or name in WINDOWS_AGENTS}
 # Launch flags carried over to the resume command, with how many values each takes
 # ("+": one or more, up to the next flag). Only flags that set up how the agent runs
 # and that its resume command accepts; never ones that pick or start a session
@@ -100,13 +113,21 @@ KEEP_FLAGS = {
 }
 MAX_ARGS = 64
 MAX_ARG_LEN = 1024
-AGENT_NAMES = set().union(*(a["names"] for a in AGENTS.values()))
-SHELLS = {"fish", "bash", "zsh", "sh", "dash", "ksh", "mksh"}
+AGENT_NAMES = set().union(*(a["names"] for a in ALL_AGENTS.values()))
+SHELLS = {"fish", "bash", "zsh", "sh", "dash", "ksh", "mksh", "pwsh", "powershell", "cmd"}
 # 8–128 characters. Pi custom ids may contain "_" and "."; Kiro V3 ids look like sess_<uuid>.
 SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$")
-# Typed into a shell between single quotes: no quotes, backslashes or control characters.
+# Typed into a POSIX shell between single quotes: no quotes, backslashes or control characters.
 TYPABLE_PATH_RE = re.compile(r"^/[^'\\\x00-\x1f\x7f]*$")
 TYPABLE_ARG_RE = re.compile(r"^[^'\\\x00-\x1f\x7f]*$")
+# Windows. Control characters and line/paragraph separators can never be typed safely.
+UNTYPABLE_RE = re.compile(r"[\x00-\x1f\x7f\x85  ]")
+WIN_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)")
+# PowerShell treats these as single-quote characters inside '...': each must be doubled.
+PS_QUOTES = "'‘’‚‛"
+# cmd.exe has no quoting that survives %, ^, &, |, <, >, ! or a double quote: those are refused.
+CMD_UNSAFE_RE = re.compile(r"[%^&|<>!\"\x00-\x1f\x7f\x85  ]")
+SHELL_KINDS = {"pwsh": "ps", "powershell": "ps", "cmd": "cmd"}
 
 SEND_GAP = 0.15      # seconds between two terminals, like the Herdr TUI's spacing
 SHELL_SETTLE = 1.5   # a restored shell runs this long before anything is typed into it
@@ -116,6 +137,7 @@ VERIFY_WAIT = 5.0    # after typing, how long `resume` gives agents before check
 QUICK_EXIT = 10.0    # an agent `here` started that exits sooner than this, with an error, failed
 HOOK_HC_TIMEOUT = 3  # the agent waits for its hook: never hold it up long
 LOG_LIMIT = 256 * 1024
+AUTO_INTERVAL = 10.0  # seconds between the background watcher's looks at the terminals
 
 NOT_STARTED = "shell not started yet"
 BY_SHELL = "resumed by its shell"
@@ -158,20 +180,47 @@ def _proc_ps(pid):
     return {"ppid": int(parts[0]), "names": _names(parts[1]), "start": None}
 
 
+WIN_EXTENSIONS = (".exe", ".cmd", ".bat", ".ps1", ".com")
+
+
 def _names(*raw):
-    return {os.path.basename(n.strip()).lstrip("-") for n in raw if n and n.strip()}
+    out = set()
+    for name in raw:
+        if not (name and name.strip()):
+            continue
+        base = re.split(r"[\\/]", name.strip())[-1] if IS_WIN else os.path.basename(name.strip())
+        base = base.lstrip("-")
+        if IS_WIN:
+            base = base.lower()
+            if base.endswith(WIN_EXTENSIONS):
+                base = base[:base.rindex(".")]
+        if base:
+            out.add(base)
+    return out
+
+
+def _proc_windows(pid, table=None):
+    table = winproc.snapshot() if table is None else table
+    row = table.get(pid)
+    if not row:
+        return None
+    return {"ppid": row[0], "names": _names(row[1]), "start": winproc.start_time(pid)}
 
 
 def proc(pid):
     """{ppid, names, start} of a process, or None when it's gone."""
     if not isinstance(pid, int) or pid <= 0:
         return None
+    if IS_WIN:
+        return _proc_windows(pid)
     if os.path.isdir("/proc/self"):
         return _proc_linux(pid)
     return _proc_ps(pid)
 
 
 def alive(pid):
+    if IS_WIN:
+        return winproc.alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -179,6 +228,14 @@ def alive(pid):
     except PermissionError:
         return True
     return True
+
+
+def process_start(pid):
+    """A value that identifies this process run (so a reused pid differs), or None."""
+    if IS_WIN:
+        return winproc.start_time(pid)
+    info = proc(pid)
+    return info.get("start") if info else None
 
 
 def find_agent(agent, pid, lookup=proc):
@@ -236,6 +293,12 @@ def placement(agent_pid, shell_pid, lookup=proc):
 
 def shell_age(pid):
     """Seconds since the process started, or None when unknown."""
+    if IS_WIN:
+        started = winproc.start_time(pid)
+        if not started:
+            return None
+        # FILETIME: 100 ns ticks since 1601-01-01; 11644473600 s to the Unix epoch.
+        return max(0.0, time.time() - (started / 1e7 - 11644473600))
     info = proc(pid)
     if not info or info.get("start") is None:
         return None
@@ -249,6 +312,9 @@ def shell_age(pid):
 
 def wait_exit(pid):
     """Block until `pid` exits."""
+    if IS_WIN:
+        winproc.wait_exit(pid)
+        return
     if hasattr(os, "pidfd_open"):
         try:
             fd = os.pidfd_open(pid)
@@ -268,6 +334,8 @@ def wait_exit(pid):
 
 def boot_id():
     """Something that changes with every boot, or None."""
+    if IS_WIN:
+        return winproc.boot_id()
     try:
         with open("/proc/sys/kernel/random/boot_id") as f:
             return f.read().strip() or None
@@ -286,6 +354,8 @@ def boot_id():
 def proc_argv(pid):
     """A process's argv, or None where it can't be read exactly (only Linux has
     /proc/<pid>/cmdline; `ps` joins the words with spaces)."""
+    if IS_WIN:
+        return winproc.command_line(pid)
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as f:
             raw = f.read()
@@ -294,10 +364,47 @@ def proc_argv(pid):
     return [a.decode("utf-8", "replace") for a in raw.split(b"\0")[:-1]] or None
 
 
+DANGEROUS_CONFIG_RE = re.compile(
+    r"(?:sandbox_mode|approval_policy|sandbox)\s*=\s*[\"']?(?:danger-full-access|never)\b", re.I)
+DANGEROUS_ALWAYS = ("--dangerously", "--yolo", "--always-approve", "--trust-all-tools", "--approve-for-me")
+
+
+def dangerous(group):
+    """True for a launch-flag group that switches off the agent's permission prompts or
+    sandbox. A resume never brings these back: whoever resumes decides again."""
+    name, eq, inline = group[0].partition("=")
+    values = [inline] if eq else group[1:]
+    value = " ".join(values).strip().lower()
+    if "dangerously" in name or name.startswith(DANGEROUS_ALWAYS):
+        return True
+    if name == "--permission-mode":
+        return value in ("bypasspermissions", "dontask")
+    if name in ("-s", "--sandbox"):
+        return value == "danger-full-access"
+    if name in ("-a", "--ask-for-approval"):
+        return value == "never"
+    if name in ("-c", "--config"):
+        return bool(DANGEROUS_CONFIG_RE.search(" ".join(values)))
+    return False
+
+
+def split_flags(agent, args):
+    """(kept groups, dropped dangerous groups) of the launch flags in `args`."""
+    kept, dropped = [], []
+    for group in _flag_groups(agent, args):
+        # The Windows port never inherits permission-bypass flags; Linux/macOS keep upstream's behavior.
+        (dropped if IS_WIN and dangerous(group) else kept).append(group)
+    return kept, dropped
+
+
 def launch_flags(agent, args):
     """The launch flags in `args` (an argv without argv[0]) worth keeping on resume, as
     groups: [flag, value, ...]. Everything else (session pickers, prompts, unknown
-    flags and their values) is left out."""
+    flags and their values, permission-bypass flags) is left out."""
+    return split_flags(agent, args)[0]
+
+
+def _flag_groups(agent, args):
     keep = KEEP_FLAGS[agent]
     groups, i = [], 0
     args = [a for a in (args or []) if isinstance(a, str)]
@@ -339,8 +446,18 @@ def flat(groups):
 
 # ---------------------------------------------------------------- herdr-core
 
+def _no_window():
+    """subprocess options so a helper never flashes a console window on Windows."""
+    return {"creationflags": 0x08000000} if IS_WIN else {}  # CREATE_NO_WINDOW
+
+
 def hc_path():
-    return shutil.which("hc") or os.path.expanduser("~/.local/bin/hc")
+    found = shutil.which("hc")
+    if found:
+        return found
+    if IS_WIN:
+        return os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "herdr-core", "hc.exe")
+    return os.path.expanduser("~/.local/bin/hc")
 
 
 def hc(args, plain=False, timeout=10):
@@ -351,7 +468,8 @@ def hc(args, plain=False, timeout=10):
         env.pop("HC_TERMINAL_ID", None)
         env.pop("HC_SCOPE", None)
     try:
-        r = subprocess.run([hc_path(), *args], capture_output=True, text=True, timeout=timeout, env=env)
+        r = subprocess.run([hc_path(), *args], capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=timeout, env=env, **_no_window())
     except (OSError, subprocess.SubprocessError) as error:
         raise HcError(f"hc {args[0]}: {error}") from error
     if r.returncode != 0:
@@ -384,6 +502,8 @@ def parse_label(labels):
     if not isinstance(value, dict):
         return None, "invalid session label: expected an object"
     agent = value.get("agent")
+    if isinstance(agent, str) and agent in ALL_AGENTS and agent not in AGENTS:
+        return None, None  # a real agent this platform doesn't resume: stay quiet
     if not isinstance(agent, str) or agent not in AGENTS:
         return None, "invalid session label: unsupported agent"
     if not valid_session(value.get("session")):
@@ -394,6 +514,11 @@ def parse_label(labels):
         path = value.get(field)
         if not isinstance(path, str) or not os.path.isabs(path) or "\0" in path:
             return None, f"invalid session label: {field} must be an absolute path"
+    if IS_WIN and not WIN_PATH_RE.match(value["cwd"]):
+        return None, "invalid session label: cwd must be a drive or UNC path"
+    started = value.get("shell_start")
+    if started is not None and (type(started) is not int or started <= 0):
+        return None, "invalid session label: shell_start must be a positive number"
     for field in ("pid", "shell"):
         pid = value.get(field)
         if type(pid) is not int or pid <= 0:
@@ -438,6 +563,13 @@ def log(event, **fields):
 
 
 def runtime_dir():
+    if IS_WIN:
+        # Per-user and not shared: %LOCALAPPDATA% is ACL'd to the user. A test can point
+        # AGENT_RESUME_RUNTIME elsewhere.
+        base = os.environ.get("AGENT_RESUME_RUNTIME") or os.path.join(
+            os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "herdr-agent-resume")
+        os.makedirs(base, exist_ok=True)
+        return base
     base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
     folder = os.path.join(base, f"herdr-agent-resume-{os.getuid()}")
     os.makedirs(folder, mode=0o700, exist_ok=True)
@@ -446,6 +578,15 @@ def runtime_dir():
 
 def runtime_lock(name):
     """An exclusive lock held until this process exits, or None if someone holds it."""
+    if IS_WIN:
+        import msvcrt
+        fd = os.open(os.path.join(runtime_dir(), name + ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError:
+            os.close(fd)
+            return None
+        return fd
     import fcntl
     fd = os.open(os.path.join(runtime_dir(), name + ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
     try:
@@ -454,6 +595,99 @@ def runtime_lock(name):
         os.close(fd)
         return None
     return fd
+
+
+# ---------------------------------------------------------------- state and settings
+
+STATE_KEEP_DAYS = 30
+ATTEMPTS_KEPT = 10
+
+
+def _json_file(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            value = json.load(f)
+        return value if isinstance(value, type(default)) else default
+    except (OSError, ValueError):
+        return default
+
+
+def _write_json(path, value):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp = f"{path}.{os.getpid()}.tmp"
+    with open(temp, "w", encoding="utf-8") as f:
+        json.dump(value, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(temp, path)
+
+
+def config_path():
+    return os.path.join(data_dir(), "config.json")
+
+
+def load_config():
+    """Settings. `auto` (default off) lets the background watcher resume sessions."""
+    config = _json_file(config_path(), {})
+    return {"auto": config.get("auto") is True,
+            "interval": config["interval"] if type(config.get("interval")) in (int, float)
+            and 2 <= config["interval"] <= 3600 else AUTO_INTERVAL}
+
+
+def set_auto(enabled):
+    config = _json_file(config_path(), {})
+    config["auto"] = bool(enabled)
+    _write_json(config_path(), config)
+    log("auto", outcome="on" if enabled else "off")
+    return load_config()
+
+
+def state_path():
+    return os.path.join(data_dir(), "state.json")
+
+
+def load_state():
+    state = _json_file(state_path(), {})
+    state.setdefault("sessions", {})
+    return state
+
+
+def session_key(agent, session):
+    return f"{agent}:{session}"
+
+
+def record_attempt(item, mode, outcome, detail=None):
+    """Remember what happened to a session so a failure stays visible and an automatic
+    pass never repeats itself. `outcome`: "typed" (the command went in, agent was seen
+    up), "failed" (it didn't come up) or "skipped". `mode`: "manual" or "auto"."""
+    lock = runtime_lock("state")
+    try:
+        state = load_state()
+        entry = state["sessions"].setdefault(session_key(item["agent"], item["session"]), {"attempts": []})
+        stamp = int(time.time())
+        entry["attempts"] = (entry.get("attempts") or [])[-(ATTEMPTS_KEPT - 1):] + [
+            {"at": stamp, "mode": mode, "outcome": outcome, "terminal": item.get("terminal"),
+             **({"detail": detail} if detail else {})}]
+        entry["last"] = outcome
+        entry["updated"] = stamp
+        if mode == "auto":
+            entry["auto_label_at"] = item.get("label_at")
+        cutoff = stamp - STATE_KEEP_DAYS * 86400
+        state["sessions"] = {k: v for k, v in state["sessions"].items() if (v.get("updated") or 0) >= cutoff}
+        _write_json(state_path(), state)
+    except OSError as error:
+        log("state", outcome=f"couldn't save: {error}")
+    finally:
+        if lock is not None:
+            os.close(lock)
+
+
+def auto_veto(label):
+    """Reason the automatic pass must leave this session alone, or None. Each noted
+    session is tried automatically once; `resume` (the key press) always may retry."""
+    entry = load_state()["sessions"].get(session_key(label["agent"], label["session"]))
+    if entry and entry.get("auto_label_at") is not None and entry["auto_label_at"] == label.get("at"):
+        return "already tried automatically (press Ctrl+Shift+R to retry)"
+    return None
 
 
 # ---------------------------------------------------------------- hook
@@ -579,6 +813,12 @@ def remember(term, agent, session, cwd, transcript, agent_pid, shell, watcher=Tr
     """Label the terminal with the session (and the agent's launch flags) and start its watcher."""
     label = {"agent": agent, "session": session, "cwd": cwd, "transcript": transcript,
              "pid": agent_pid, "shell": shell, "boot": boot_id(), "at": int(time.time() * 1000)}
+    if IS_WIN:
+        # Pids are reused quickly on Windows and Fast Startup keeps the boot time across a
+        # shutdown, so also remember which run of the shell this was.
+        shell_start = winproc.start_time(shell)
+        if shell_start:
+            label["shell_start"] = shell_start
     argv = proc_argv(agent_pid) if launch_args is None else None
     if launch_args is not None or argv:
         label["args"] = flat(launch_flags(agent, launch_args if launch_args is not None else argv[1:]))
@@ -586,7 +826,15 @@ def remember(term, agent, session, cwd, transcript, agent_pid, shell, watcher=Tr
     if watcher:
         subprocess.Popen([sys.executable, os.path.abspath(__file__), "watch", term, str(agent_pid), str(shell)],
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         close_fds=True, start_new_session=True)
+                         close_fds=True, **_detached())
+
+
+def _detached():
+    """Popen options that start a helper beside the agent and outlive the hook."""
+    if IS_WIN:
+        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+        return {"creationflags": 0x00000008 | 0x00000200 | 0x08000000}
+    return {"start_new_session": True}
 
 
 def claude_session_of(pid, home=None):
@@ -614,7 +862,12 @@ def adopt():
     for terminal in gather():
         fg, shell = terminal.get("foreground") or {}, terminal.get("pid")
         agent_pid = fg.get("pid")
-        if not shell or not agent_pid or not (_names(fg.get("name") or "") & AGENTS["claude"]["names"]):
+        if IS_WIN and shell:
+            # The core reports the shell as foreground; the agent is one of its descendants.
+            agent_pid = find_descendant(shell, AGENTS["claude"]["names"])
+            if not agent_pid:
+                continue
+        elif not shell or not agent_pid or not (_names(fg.get("name") or "") & AGENTS["claude"]["names"]):
             continue
         item = {"terminal": terminal["address"], "where": (terminal.get("labels") or {}).get("where"), "agent": "claude"}
         label = read_label(terminal.get("labels"))
@@ -662,12 +915,57 @@ def lost(terminal, label, boot):
     """True when the program the agent ran under is gone: another boot, or another process."""
     if boot and label.get("boot") and label["boot"] != boot:
         return True
-    return terminal.get("pid") != label.get("shell")
+    if terminal.get("pid") != label.get("shell"):
+        return True
+    saved = label.get("shell_start")
+    if saved and terminal.get("pid"):
+        now = process_start(terminal["pid"])
+        # Same number but another run of it: a reused pid, even on the same boot.
+        if now is not None and now != saved:
+            return True
+    return False
+
+
+CONSOLE_HELPERS = {"conhost", "openconsole", "wslhost"}
+
+
+def descendants(pid, table=None, depth=4):
+    """Image names of everything running under `pid` (Windows). The core reports the
+    terminal's shell as its foreground even while an agent runs under it, so "is the shell
+    idle" has to be answered from the process tree."""
+    if not IS_WIN or not pid:
+        return set()
+    table = winproc.snapshot() if table is None else table
+    names, level = set(), {pid}
+    for _ in range(depth):
+        level = {child for child, (parent, _) in table.items() if parent in level and child != pid}
+        if not level:
+            break
+        for child in level:
+            names |= _names(table[child][1])
+    return names
+
+
+def find_descendant(pid, names, depth=4):
+    """The nearest process under `pid` whose image name is in `names` (Windows), or None."""
+    table = winproc.snapshot()
+    level = {pid}
+    for _ in range(depth):
+        level = {child for child, (parent, _) in table.items() if parent in level and child != pid}
+        for child in sorted(level):
+            if _names(table[child][1]) & names:
+                return child
+        if not level:
+            break
+    return None
 
 
 def at_shell(terminal):
     fg = terminal.get("foreground") or {}
-    return bool(terminal.get("pid")) and fg.get("pid") == terminal.get("pid") and _names(fg.get("name") or "") & SHELLS
+    idle = bool(terminal.get("pid")) and fg.get("pid") == terminal.get("pid") and _names(fg.get("name") or "") & SHELLS
+    if idle and IS_WIN:
+        return not (descendants(terminal["pid"]) - CONSOLE_HELPERS)
+    return idle
 
 
 def starting_agent(terminal, agent):
@@ -676,6 +974,8 @@ def starting_agent(terminal, agent):
     fg = terminal.get("foreground") or {}
     argv = [a for a in (fg.get("argv") or [])[:3] if isinstance(a, str)]
     names = _names(fg.get("name") or "", *argv)
+    if IS_WIN and terminal.get("pid"):
+        names |= descendants(terminal["pid"])
     return bool(names & AGENTS[agent]["names"]) or "agent_resume.py" in names
 
 
@@ -693,8 +993,82 @@ def _quote(arg):
     return arg if re.match(r"^[A-Za-z0-9_@%+=:,./-]+$", arg) else f"'{arg}'"
 
 
-def command(label):
+def shell_kind(terminal):
+    """How to type into this terminal's shell: "ps" (PowerShell), "cmd", "posix" or None
+    for a shell this platform can't type into safely."""
+    fg = terminal.get("foreground") or {}
+    names = _names(fg.get("name") or "")
+    if IS_WIN:
+        for name in names:
+            if name in SHELL_KINDS:
+                return SHELL_KINDS[name]
+        return None
+    return "posix"
+
+
+def ps_quote(arg):
+    """One PowerShell argument as a single-quoted literal: nothing in it is expanded, and
+    every quote-like character (including the typographic ones) is doubled."""
+    if UNTYPABLE_RE.search(arg):
+        raise ValueError("untypable character")
+    return "'" + "".join(c * 2 if c in PS_QUOTES else c for c in arg) + "'"
+
+
+def cmd_quote(arg):
+    """One cmd.exe argument. cmd has no quoting that is safe against %, ^, &, |, <, >, !
+    and "; those never get here (see `typable`)."""
+    if CMD_UNSAFE_RE.search(arg):
+        raise ValueError("untypable character")
+    return arg if re.fullmatch(r"[A-Za-z0-9_@+=:,./\\-]+", arg) else f'"{arg}"'
+
+
+def typable(arg, kind):
+    """True when `arg` can be typed into this kind of shell exactly as it is."""
+    if kind == "ps":
+        # Embedded double quotes are mangled by PowerShell's native-argument passing.
+        return not UNTYPABLE_RE.search(arg) and '"' not in arg
+    if kind == "cmd":
+        return not CMD_UNSAFE_RE.search(arg)
+    return bool(TYPABLE_ARG_RE.match(arg))
+
+
+def flag_report(label, kind=None):
+    """(kept groups, names of flags left out) for a resume command typed into `kind`."""
+    kept, omitted = [], []
+    all_groups = _flag_groups(label["agent"], label.get("args") or [])
+    for group in all_groups:
+        if dangerous(group):
+            omitted.append(group[0].partition("=")[0])
+        elif kind is not None and not all(typable(a, kind) for a in group):
+            omitted.append(group[0].partition("=")[0])
+        else:
+            kept.append(group)
+    return kept, omitted
+
+
+def windows_command(label, kind):
+    """What to type into PowerShell or cmd.exe, or None when the folder can't be typed
+    safely. Fixed words are bare; everything that came from a label is quoted."""
+    cwd = label.get("cwd")
+    if not isinstance(cwd, str) or not WIN_PATH_RE.match(cwd) or not typable(cwd, kind):
+        return None
+    if kind == "cmd" and cwd.startswith("\\\\"):
+        return None  # `cd /d` can't enter a UNC path
+    words = AGENTS[label["agent"]]["argv"](label["session"])
+    flags = flat(flag_report(label, kind)[0])
+    if kind == "ps":
+        run = " ".join([words[0], *(ps_quote(a) for a in [*words[1:], *flags])])
+        return f"Set-Location -LiteralPath {ps_quote(cwd)} -ErrorAction Stop; if ($?) {{ {run} }}"
+    if kind == "cmd":
+        run = " ".join([words[0], *(cmd_quote(a) for a in [*words[1:], *flags])])
+        return f'cd /d {cmd_quote(cwd)} && {run}'
+    return None
+
+
+def command(label, kind=None):
     """What to type, or None when the folder can't be typed safely."""
+    if IS_WIN:
+        return windows_command(label, kind or "ps")
     cwd = label.get("cwd")
     if not isinstance(cwd, str) or not TYPABLE_PATH_RE.match(cwd):
         return None
@@ -707,8 +1081,10 @@ def command(label):
     return f"cd '{cwd}' && " + " ".join(_quote(a) for a in resume_argv(label, typable_only=True))
 
 
-def plan(terminals, boot, folder_ok=os.path.isdir, file_ok=os.path.isfile):
-    """Which terminals to resume. Pure: `terminals` are `hc get` records."""
+def plan(terminals, boot, folder_ok=os.path.isdir, file_ok=os.path.isfile, veto=None):
+    """Which terminals to resume. Pure: `terminals` are `hc get` records. `veto(label)`
+    may return a reason to leave a session alone (the automatic pass uses it to resume
+    each session at most once)."""
     entries, skipped = [], []
     for terminal in terminals:
         if terminal.get("state") != "live":
@@ -727,8 +1103,17 @@ def plan(terminals, boot, folder_ok=os.path.isdir, file_ok=os.path.isfile):
         key = (label["agent"], label["session"])
         item = {"terminal": terminal["address"], "where": (terminal.get("labels") or {}).get("where"),
                 "agent": label["agent"], "session": label["session"], "cwd": label.get("cwd")}
-        typed = command(label)
-        if key in still_open:
+        if IS_WIN:
+            item["label_at"] = label.get("at")  # lets the automatic pass try each noted session once
+        kind = shell_kind(terminal)
+        typed = command(label, kind) if kind else None
+        omitted = flag_report(label, kind)[1] if IS_WIN else []
+        if omitted:
+            item["omitted_flags"] = omitted
+        vetoed = veto(label) if veto else None
+        if vetoed:
+            reason = vetoed
+        elif key in still_open:
             reason = "open in another terminal"
         elif key in taken:
             reason = "resumed in another terminal"
@@ -736,6 +1121,8 @@ def plan(terminals, boot, folder_ok=os.path.isdir, file_ok=os.path.isfile):
             reason = NOT_STARTED
         elif not at_shell(terminal):
             reason = BY_SHELL if starting_agent(terminal, label["agent"]) else "something else is running there"
+        elif kind is None:
+            reason = "its shell isn't PowerShell or cmd, so nothing can be typed safely"
         elif not folder_ok(label.get("cwd")):
             reason = "its folder is gone"
         elif not file_ok(label.get("transcript")):
@@ -796,14 +1183,24 @@ def failed_start(address, boot):
     return f"{EXITED}: {said}" if said else EXITED
 
 
-def resume(dry_run=False, wait=START_WAIT):
+def resume(dry_run=False, wait=START_WAIT, auto=False):
+    """One pass. `auto`: the background watcher's pass: each session at most once, and no
+    waiting for shells that haven't started (the next look catches them)."""
     lock = runtime_lock("resume")
     if lock is None:
         return {"busy": True, "resumed": [], "skipped": []}
+    try:
+        return _resume(dry_run, wait, auto)
+    finally:
+        os.close(lock)  # the background watcher runs many passes in one process
+
+
+def _resume(dry_run, wait, auto):
     boot = boot_id()
-    deadline = time.monotonic() + wait
+    mode = "auto" if auto else "manual"
+    deadline = time.monotonic() + (0 if auto else wait)
     while True:
-        todo, skipped = plan(gather(), boot)
+        todo, skipped = plan(gather(), boot, veto=auto_veto if auto else None)
         if dry_run or time.monotonic() >= deadline or not any(s["reason"] == NOT_STARTED for s in skipped):
             break
         time.sleep(0.5)
@@ -828,9 +1225,11 @@ def resume(dry_run=False, wait=START_WAIT):
             hc(["send", item["terminal"], item["command"]], plain=True)
         except HcError as error:
             skipped.append({**item, "reason": f"couldn't type into it: {error}"})
+            record_attempt(item, mode, "failed", f"couldn't type into it: {error}")
             continue
         resumed.append(item)
-        log("resume", terminal=item["terminal"], where=item["where"], agent=item["agent"], session=item["session"])
+        log("resume", mode=mode, terminal=item["terminal"], where=item["where"], agent=item["agent"],
+            session=item["session"], **({"omitted_flags": item["omitted_flags"]} if item.get("omitted_flags") else {}))
     if resumed:
         time.sleep(VERIFY_WAIT)
         for item in list(resumed):
@@ -838,9 +1237,40 @@ def resume(dry_run=False, wait=START_WAIT):
             if why:
                 resumed.remove(item)
                 skipped.append({**item, "reason": why})
+                record_attempt(item, mode, "failed", why)
+            else:
+                record_attempt(item, mode, "typed")
     for item in skipped:
-        log("skip", terminal=item["terminal"], agent=item["agent"], session=item["session"], reason=item["reason"])
+        if auto and item["reason"].startswith(("already tried", "shell not started")):
+            continue  # the watcher looks again every few seconds: don't log each look
+        log("skip", mode=mode, terminal=item["terminal"], agent=item["agent"], session=item["session"],
+            reason=item["reason"])
     return {"resumed": resumed, "skipped": skipped}
+
+
+def auto_watch(once=False):
+    """The background watcher (`auto-watch`). Every few seconds, while `auto` is on in
+    config.json and herdr-core is reachable, run one automatic pass. Starting a terminal
+    yourself never matters here: only a terminal whose saved session lost its agent is
+    touched, and each saved session is tried once."""
+    lock = runtime_lock("auto-watch")
+    if lock is None:
+        return "already running"
+    log("auto", outcome="watcher started", pid=os.getpid())
+    while True:
+        config = load_config()
+        if config["auto"]:
+            try:
+                out = resume(auto=True)
+                if out.get("resumed"):
+                    log("auto", outcome=f"resumed {len(out['resumed'])}")
+            except HcError:
+                pass  # herdr-core isn't running (yet)
+            except Exception as error:  # the watcher must keep going
+                log("auto", outcome=f"error: {error}")
+        if once:
+            return "ok"
+        time.sleep(config["interval"])
 
 
 # ---------------------------------------------------------------- here (auto-resume)
@@ -1038,6 +1468,10 @@ def launch_kiro(session, env=None):
 def here(env=None, shell_pid=None):
     """Called by a starting shell. Starts the agent when its terminal lost one and
     returns its exit code; returns why not otherwise."""
+    if IS_WIN:
+        # Windows resumes from outside the shell (the `auto-watch` helper), so no shell
+        # startup file is touched.
+        return "not used on Windows"
     env = os.environ if env is None else env
     term = env.get("HC_TERMINAL_ID")
     if not term:
@@ -1103,8 +1537,59 @@ def after(code, env=None):
 
 # ---------------------------------------------------------------- CLI
 
+def doctor():
+    """A health report: what is installed, whether herdr-core answers, and the settings."""
+    report = {"platform": sys.platform, "python": sys.version.split()[0], "script": os.path.abspath(__file__),
+              "data_dir": data_dir(), "config": load_config(), "boot": boot_id(), "hc": hc_path()}
+    try:
+        report["core"] = "reachable" if hc_json(["ls"]) is not None else "unknown"
+    except HcError as error:
+        report["core"] = f"not reachable: {error}"
+    report["failed_sessions"] = {key: entry.get("attempts", [])[-1:] for key, entry in load_state()["sessions"].items()
+                                 if entry.get("last") == "failed"}
+    return report
+
+
+def tail_log(count=20):
+    try:
+        with open(os.path.join(data_dir(), "log.jsonl"), encoding="utf-8") as f:
+            lines = f.read().splitlines()[-count:]
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue
+    return out
+
+
 def main(argv):
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")  # Windows consoles default to a legacy code page
     command_name = argv[1] if len(argv) > 1 else "status"
+    if command_name == "auto":
+        action = argv[2] if len(argv) > 2 else "status"
+        if action in ("on", "off"):
+            print(json.dumps(set_auto(action == "on")))
+        elif action == "status":
+            print(json.dumps(load_config()))
+        else:
+            print("usage: agent_resume.py auto on|off|status", file=sys.stderr)
+            return 2
+        return 0
+    if command_name == "auto-watch":
+        print(auto_watch(once="--once" in argv))
+        return 0
+    if command_name == "doctor":
+        print(json.dumps(doctor(), indent=2, ensure_ascii=False))
+        return 0
+    if command_name == "log":
+        for entry in tail_log(int(argv[2]) if len(argv) > 2 and argv[2].isdigit() else 20):
+            print(json.dumps(entry, ensure_ascii=False))
+        return 0
     if command_name == "launch-kiro":
         try:
             return launch_kiro(argv[2] if len(argv) > 2 else "")
@@ -1113,7 +1598,9 @@ def main(argv):
             return 1
     if command_name == "hook":
         agent = argv[2] if len(argv) > 2 else ""
-        raw = sys.stdin.read()
+        # Bytes, decoded as UTF-8: the agent writes UTF-8 JSON, but Windows' text-mode
+        # stdin would use the console code page and garble a Chinese folder name.
+        raw = sys.stdin.buffer.read().decode("utf-8", "replace") if hasattr(sys.stdin, "buffer") else sys.stdin.read()
         outcome = "ignored"
         if agent in AGENTS:
             try:
@@ -1164,6 +1651,10 @@ def main(argv):
                 out = adopt()
             else:
                 out = resume(dry_run=command_name == "status" or "--dry-run" in argv)
+                if out.get("dry_run"):
+                    out["auto"] = load_config()
+                    out["history"] = {k: {"last": v.get("last"), "attempts": v.get("attempts", [])[-3:]}
+                                      for k, v in load_state()["sessions"].items()}
         except HcError as error:
             print(json.dumps({"error": str(error)}))
             return 1

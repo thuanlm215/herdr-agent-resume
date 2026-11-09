@@ -8,6 +8,8 @@ import { exec, appHome, theme, props, closeOverlay, notify } from "herdr";
 import { summary } from "./summary.js";
 
 const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+// The installer rewrites this line to "python" on Windows (there is no python3 there).
+const PYTHON = "python3";
 
 export default class AgentResume extends View {
   init(_props, cx) {
@@ -15,7 +17,7 @@ export default class AgentResume extends View {
     cx.spawn(async (cx) => {
       try {
         const script = `${appHome()}/mods/agent-resume/agent_resume.py`;
-        const r = await exec("python3", [script, "resume"]);
+        const r = await exec(PYTHON, [script, "resume"]);
         let out;
         try {
           out = JSON.parse(r.stdout);

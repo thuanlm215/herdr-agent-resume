@@ -22,7 +22,10 @@ export function summary(out) {
     };
   }
   if (resumed.length) {
-    return { title: `Resumed ${plural(resumed.length, "agent")}`, body: resumed.map(place).join(", "), level: "success", timeout: 5000 };
+    // Permission-bypass flags are never carried over: say so, so nobody expects them.
+    const left = [...new Set(resumed.flatMap((r) => r.omitted_flags || []))];
+    const note = left.length ? ` (flags left out: ${left.join(" ")})` : "";
+    return { title: `Resumed ${plural(resumed.length, "agent")}`, body: resumed.map(place).join(", ") + note, level: "success", timeout: 5000 };
   }
   if (missed.length) {
     return { title: `Couldn't resume ${plural(missed.length, "agent")}`, body: why, level: "warning", timeout: 8000 };

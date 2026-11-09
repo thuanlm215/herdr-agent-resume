@@ -1,11 +1,15 @@
 import importlib.util
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest import mock
 from contextlib import redirect_stdout
 from io import StringIO
+
+if sys.platform == "win32":
+    raise unittest.SkipTest("POSIX-only suite; see test_install_windows.py")
 
 spec = importlib.util.spec_from_file_location("installer", Path(__file__).parents[1] / "scripts/install.py")
 installer = importlib.util.module_from_spec(spec)
