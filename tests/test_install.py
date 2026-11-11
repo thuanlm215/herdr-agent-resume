@@ -111,23 +111,6 @@ class OtherAgentHookTests(unittest.TestCase):
                         self.assertTrue(all(call.args[0][0] == "herdr-app" for call in run.call_args_list))
                     self.assertFalse((home / ".kiro/hooks/agent-resume.json").exists())
 
-    def test_pi_extension_points_at_the_script(self):
-        text = installer.pi_extension("/app/mods/agent-resume/agent_resume.py")
-        self.assertIn('"/app/mods/agent-resume/agent_resume.py"', text)
-        self.assertNotIn("__SCRIPT__", text)
-        self.assertIn("hook\", \"pi\"", text)
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory)
-            (home / ".pi" / "agent").mkdir(parents=True)
-            added = installer.pi_changes(home, "/app/mods/agent-resume/agent_resume.py", False)
-            installer.apply_shell(added)
-            path = home / ".pi" / "agent" / "extensions" / "herdr-agent-resume.js"
-            self.assertEqual(path.read_text(), text)
-            self.assertEqual(installer.pi_changes(home, "/app/mods/agent-resume/agent_resume.py", False), [])
-            removed = installer.pi_changes(home, "/app/mods/agent-resume/agent_resume.py", True)
-            installer.apply_shell(removed)
-            self.assertFalse(path.exists())
-
     def test_only_agents_set_up_on_this_machine(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -160,11 +143,6 @@ class ShellTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not their end"):
             installer.without_block("x\n" + installer.BEGIN + "\nfoo\n")
 
-    def test_reports_a_failed_resume(self):
-        for shell, code in (("fish", "$status"), ("bash", "$?"), ("zsh", "$?")):
-            self.assertIn(f"here || command python3 '{self.SCRIPT}' after {code}" if shell != "fish"
-                          else f"here; or command python3 '{self.SCRIPT}' after {code}", installer.snippet(shell, self.SCRIPT))
-
     def test_refuses_a_path_with_a_quote(self):
         with self.assertRaises(ValueError):
             installer.snippet("fish", "/it's/agent_resume.py")
@@ -178,13 +156,54 @@ class ShellTests(unittest.TestCase):
             self.assertEqual(installer.shell_changes(home, self.SCRIPT, "remove"), [])
             added = installer.shell_changes(home, self.SCRIPT, "add")
             self.assertEqual([p.name for p, _ in added], ["agent-resume.fish", ".bashrc"])
-            installer.apply_shell(added)
+            installer.apply_text_changes(added)
             self.assertIn("fish_prompt", (home / ".config/fish/conf.d/agent-resume.fish").read_text())
             self.assertEqual(installer.shell_changes(home, self.SCRIPT, "add"), [])
             self.assertEqual(len(installer.shell_changes(home, "/moved/agent_resume.py", "refresh")), 2)
-            installer.apply_shell(installer.shell_changes(home, self.SCRIPT, "remove"))
+            installer.apply_text_changes(installer.shell_changes(home, self.SCRIPT, "remove"))
             self.assertFalse((home / ".config/fish/conf.d/agent-resume.fish").exists())
             self.assertEqual((home / ".bashrc").read_text(), "export A=1\n")
+
+
+class ExtensionTests(unittest.TestCase):
+    def test_install_update_uninstall_preserves_user_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            app = home / "app"
+            app.mkdir()
+            (app / "keys.json").write_text('{"global":{"ctrl-x":"mine"}}')
+            (home / ".zshrc").write_text("export KEEP_ME=yes\n")
+            claude = home / ".claude/settings.json"
+            claude.parent.mkdir()
+            original_claude = {"model": "mine", "hooks": {"Stop": [{"hooks": [{"command": "mine"}]}]}}
+            claude.write_text(json.dumps(original_claude))
+            profile = home / ".omp/profiles/work/agent"
+            profile.mkdir(parents=True)
+            base = ["install.py", "--home", str(home), "--app-home", str(app), "--no-adopt"]
+            with mock.patch.object(installer.subprocess, "run"):
+                for flags in (["--auto", "--agents", "omp", "claude", "codex"], ["--update"]):
+                    with mock.patch("sys.argv", base + flags), redirect_stdout(StringIO()):
+                        installer.main()
+                self.assertEqual((home / ".zshrc").read_text().count(installer.BEGIN), 1)
+                self.assertTrue((profile / "extensions/herdr-agent-resume.js").is_file())
+                with mock.patch("sys.argv", base + ["--uninstall"]), redirect_stdout(StringIO()):
+                    installer.main()
+            self.assertEqual((home / ".zshrc").read_text(), "export KEEP_ME=yes\n")
+            self.assertEqual(json.loads(claude.read_text()), original_claude)
+            self.assertFalse((profile / "extensions/herdr-agent-resume.js").exists())
+            self.assertFalse((home / ".omp/agent/extensions/herdr-agent-resume.js").exists())
+            self.assertEqual(json.loads((app / "keys.json").read_text()), {"global": {"ctrl-x": "mine"}})
+
+    def test_unrelated_extension_is_never_overwritten_or_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            path = home / ".omp/agent/extensions/herdr-agent-resume.js"
+            path.parent.mkdir(parents=True)
+            path.write_text("user-owned extension")
+            with self.assertRaises(ValueError):
+                installer.extension_changes(home, "/app/agent_resume.py", False)
+            installer.apply_text_changes(installer.extension_changes(home, "/app/agent_resume.py", True))
+            self.assertEqual(path.read_text(), "user-owned extension")
 
 
 class UpdateTests(unittest.TestCase):

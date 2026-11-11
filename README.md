@@ -21,6 +21,7 @@ This mod brings that back. Press **Ctrl+Shift+R** after a restart, and each term
 | Antigravity CLI (`agy`) | `cd '<folder>' && agy --conversation <session> [flags]` |
 | Pi | `cd '<folder>' && pi --session <session> [flags]` |
 | Kiro CLI V3 | `cd '<folder>' && python3 <mod>/agent_resume.py launch-kiro <session>` (starts `kiro-cli chat --v3 --resume-id <session> [flags]`) |
+| OMP | `cd '<folder>' && env <saved storage settings> omp --resume <exact-session-file> [flags]` |
 
 The agents open idle on their old conversation, with the flags they were started with (`--model`, `--dangerously-skip-permissions`, `-s workspace-write`, ...); nothing runs until you type. A toast says what came back, and which ones didn't, with the agent's own error when one exits right away.
 
@@ -44,14 +45,16 @@ python3 herdr-agent-resume/scripts/install.py
 The installer:
 - copies `mods/agent-resume/` to `~/.config/herdr-app/mods/` (after `herdr-app check`);
 - binds Ctrl+Shift+R to `mod.open:agent-resume` in `keys.json`, refusing a key already in use;
-- appends one session hook after the hooks already there, backing each file up to `~/.config/herdr-app/backups/agent-resume/` first. It writes one only for an agent that is already set up on this machine:
+- appends one session hook after the hooks already there, backing each file up to `~/.config/herdr-app/backups/agent-resume/` first. By default, it writes one only for an agent that is already set up on this machine:
   - Claude Code: `SessionStart` in `~/.claude/settings.json`
   - Codex: `SessionStart` in `~/.codex/hooks.json`
   - Grok: `SessionStart` in `~/.grok/hooks/agent-resume.json`
   - Antigravity CLI: `SessionStart` and `PreInvocation` under the name `agent-resume` in `~/.gemini/config/hooks.json`
   - Kiro CLI V3: global `SessionStart` and `UserPromptSubmit` hooks in `~/.kiro/hooks/agent-resume.json`. These work with the built-in agent and custom profiles. Install, update and uninstall leave agent profiles and `chat.defaultAgent` untouched.
   - Pi: `~/.pi/agent/extensions/herdr-agent-resume.js` (Pi has no shell hook; the extension reports the session)
+  - OMP: `~/.omp/agent/extensions/herdr-agent-resume.js`, plus existing named profiles under `~/.omp/profiles/*/agent/extensions/`. Custom agent directories need the rendered extension copied into their own `extensions/` directory.
 - notes the Claude Code sessions already running in Herdr, so they're covered right away.
+- notes running OMP sessions on Linux using their exact TTY breadcrumbs and verified session headers, without sending input or restarting the agents.
 
 Then:
 - **Codex** asks you to review the new hook the next time it starts ("Hooks need review"): trust it, or Codex sessions won't be noted.
@@ -59,6 +62,8 @@ Then:
 - Codex sessions already running are noted the next time they start or resume. The same is true for Grok, Antigravity, Pi and Kiro: the hook notes them the next time that session starts.
 
 Update with `--update`, remove everything with `--uninstall`. `--dry-run` shows what would change.
+
+To prepare OMP's hook before its first launch, use `python3 herdr-agent-resume/scripts/install.py --auto --agents omp`. This installs configuration, not the CLI or credentials.
 
 ### Automatic resume
 
@@ -107,11 +112,12 @@ It also never notes:
 - A folder Claude Code hasn't been told to trust stops at its trust prompt. Folders you worked in are trusted already.
 - `claude --resume` may continue under a new session id. The hook follows it, since every start is noted.
 - **Which flags come back.** Only flags that set up how the agent runs and that its resume command accepts. Claude Code keeps `--model`, `--permission-mode`, `--dangerously-skip-permissions`, `--add-dir` and a few more. Codex keeps `-m`, `-c`, `-s`, `-a`, `--search` and a few more, but not `--full-auto` (`codex resume` doesn't take it). Grok keeps `--model`, `--permission-mode`, `--always-approve`, `--add-dir` and a few more, but not `-c` / `--continue` or `--worktree`. Antigravity keeps `--model`, `--effort`, `--mode`, `--dangerously-skip-permissions`, `--add-dir` and a few more. Pi keeps `--model`, `--thinking`, `--provider`, `--session-dir`, `--tools` and a few more. Kiro V3 keeps `--mode`, `--model`, `--effort`, `--agent`, `--trust-all-tools` and `--trust-tools`. Never a prompt, a session picker (`--resume`, `--continue`, `--session`, `--conversation`, `--resume-id`), `-p` / `--print`, or `--worktree`. The full list is `KEEP_FLAGS` in `agent_resume.py`. With Ctrl+Shift+R, a flag whose value has a quote or a backslash is left out, since it can't be typed safely; `--auto` keeps it. Flags are read from `/proc`, so on macOS they don't come back yet.
-- Supported agents: Claude Code, Codex, Grok, Antigravity CLI (`agy`), Pi and Kiro CLI. Shells: fish, bash, zsh, sh, dash, ksh (`--auto`: fish, bash, zsh).
+- Supported agents: Claude Code, Codex, Grok, Antigravity CLI (`agy`), Pi, Kiro CLI and OMP. Shells: fish, bash, zsh, sh, dash, ksh (`--auto`: fish, bash, zsh).
 - Codex notes a session at its first message, not when it opens.
 - Grok notes a session on `SessionStart`, including one reopened with `--resume`. A subagent's own session is not noted. Your hooks don't run until the folder is trusted.
 - Antigravity notes a new conversation on `SessionStart` (before the first model call) and notes again on `PreInvocation`, so a resumed conversation is picked up on its next turn. A resumed `agy` you quit before that turn is still lost, and the next pass brings it back.
 - Pi has no shell hooks. The extension notes a resumed session at startup, and a new session once its file exists (after the first message). Opening Pi and quitting before you type leaves nothing to resume.
+- OMP records the exact session file on startup, switch, fork and message boundaries, only for the main interactive session. It uses `--resume`, never `--restore`, preserving storage/profile settings and allowlisted flags without replaying a prompt. Already-running OMP processes use a temporary two-second breadcrumb watcher until they exit; newly launched processes use extension events. A stale breadcrumb is accepted only when the same process has the exact transcript open with matching path and inode. Unsaved first turns cannot be restored; no other conversation is substituted. Adoption is Linux-only.
 - Kiro support requires the V3 engine: start it with `kiro-cli chat --v3`. Global `SessionStart` and `UserPromptSubmit` hooks note conversations after the first prompt without a custom agent. V3 defers these hooks even when reopening saved history, so both resume paths supervise the Kiro job, refresh its label and forget it on exit without requiring another prompt. A quick startup error keeps the old label for retry. Resume always includes `--v3`, and uses `~/.kiro/sessions/<workspace-hash>/<session>/session.json` to check that the session exists (a new session may not have a message log yet). V2 sessions and legacy V2 labels are ignored; switching engines and migrating conversations are outside this mod. The hook prints nothing because Kiro adds stdout to context.
 - Like the Herdr TUI's resume, this relies on how each agent CLI resumes today. If a CLI changes its flags or its hook input, it can break.
 

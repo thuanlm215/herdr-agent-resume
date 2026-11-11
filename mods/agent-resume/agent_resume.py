@@ -6,7 +6,7 @@ restart) back as a shell in its last folder, but never runs the program again.
 This brings agent sessions back, the way the Herdr TUI did:
 
   hook <agent>        note the session on its terminal (an `agent-resume` label
-                      kept by herdr-core). Agents: claude, codex, grok, agy, pi, kiro
+                      kept by herdr-core). Agents: claude, codex, grok, agy, pi, kiro, omp
   resume              type that agent's resume command into each terminal that
                       lost its agent and sits at a shell
   status              what `resume` would do, without typing anything
@@ -16,10 +16,11 @@ This brings agent sessions back, the way the Herdr TUI did:
   after CODE          run by the same shell when that agent exits with CODE:
                       says so when it didn't come back (exited right away)
   launch-kiro <id>    internal: supervise a resumed V3 job before its first hook
-  adopt               note Claude Code sessions already running before the hook
-                      was installed (from ~/.claude/sessions/<pid>.json)
+  adopt               note running Claude Code and OMP sessions from their exact
+                      process/TTY registries, without sending terminal input
   watch ...           internal: forget a session once its agent exits while the
                       terminal lives on, so a session you quit stays quit
+  watch-omp ...       internal: follow an adopted OMP process's session switches
 
 Standard library only (Python 3.8+). `resume` and `status` print JSON.
 """
@@ -30,6 +31,7 @@ import os
 import re
 import select
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -42,6 +44,7 @@ AGENTS = {
     "grok": {"names": {"grok"}, "argv": lambda session: ["grok", "--resume", session]},
     "agy": {"names": {"agy"}, "argv": lambda session: ["agy", "--conversation", session]},
     "pi": {"names": {"pi"}, "argv": lambda session: ["pi", "--session", session]},
+    "omp": {"names": {"omp"}, "argv": lambda transcript: ["omp", "--resume", transcript]},
     "kiro": {"names": {"kiro", "kiro-cli", "kiro-cli-chat"},
              "argv": lambda session: ["kiro-cli", "chat", "--v3", "--resume-id", session]},
 }
@@ -93,11 +96,24 @@ KEEP_FLAGS = {
         "--append-system-prompt": "+", "--extension": "+", "-e": "+", "--skill": "+",
         "--prompt-template": "+", "--theme": "+",
     },
+    "omp": {
+        "--allow-home": 0, "--no-tools": 0, "--no-lsp": 0, "--no-pty": 0,
+        "--hide-thinking": 0, "--no-skills": 0, "--no-rules": 0, "--no-title": 0,
+        "--auto-approve": 0, "--external-thinking": 0,
+        "--model": 1, "--smol": 1, "--slow": 1, "--plan": 1, "--provider": 1,
+        "--system-prompt": 1, "--system-prompt-template": 1, "--append-system-prompt": 1,
+        "--profile": 1, "--config": 1, "--add-dir": 1, "--session-dir": 1,
+        "--models": 1, "--tools": 1, "--thinking": 1, "--service-tier": 1,
+        "--hook": 1, "--extension": 1, "-e": 1, "--skills": 1, "--approval-mode": 1,
+        "--plugin-dir": 1,
+    },
     "kiro": {
         "--trust-all-tools": 0, "-a": 0,
         "--agent": 1, "--model": 1, "--effort": 1, "--trust-tools": 1, "--mode": 1,
     },
 }
+OMP_ENV = ("OMP_PROFILE", "PI_PROFILE", "PI_CONFIG_DIR", "PI_CODING_AGENT_DIR",
+           "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME")
 MAX_ARGS = 64
 MAX_ARG_LEN = 1024
 AGENT_NAMES = set().union(*(a["names"] for a in AGENTS.values()))
@@ -405,6 +421,13 @@ def parse_label(labels):
         return None, "invalid session label: boot must be text"
     raw_args = value.get("args")
     value["args"] = flat(launch_flags(agent, raw_args)) if isinstance(raw_args, list) else []
+    if agent == "omp":
+        raw_env = value.get("env", {})
+        if not isinstance(raw_env, dict) or any(
+                key not in OMP_ENV or not isinstance(val, str) or "\0" in val or len(val) > MAX_ARG_LEN
+                for key, val in raw_env.items()):
+            return None, "invalid session label: invalid OMP environment"
+        value["env"] = raw_env
     return value, None
 
 
@@ -484,6 +507,8 @@ def is_session_event(agent, data):
         return True
     if agent == "agy" and key == "preinvocation":
         return True
+    if agent == "omp" and key == "sessionclear":
+        return True
     return agent == "kiro" and key == "userpromptsubmit"
 
 
@@ -525,6 +550,7 @@ def hook(agent, raw, env=None):
         return "not SessionStart"
     if data.get("agent_id") or data.get("agentId") or _text(data, "subagentType", "subagent_type"):
         return "subagent"
+    clearing = agent == "omp" and _event_key(data.get("hook_event_name") or data.get("hookEventName")) == "sessionclear"
     if agent == "agy":
         session = _text(data, "conversationId", "conversation_id", "session_id", "sessionId")
         paths = data.get("workspacePaths") if isinstance(data.get("workspacePaths"), list) else []
@@ -534,7 +560,7 @@ def hook(agent, raw, env=None):
         if agent == "grok":
             session = session or (env.get("GROK_SESSION_ID") if isinstance(env.get("GROK_SESSION_ID"), str) else None)
         cwd = _text(data, "cwd")
-    if not valid_session(session):
+    if not clearing and not valid_session(session):
         return "no usable session id"
     if agent == "kiro" and not session.startswith("sess_"):
         return "Kiro V2 is not supported"
@@ -549,8 +575,10 @@ def hook(agent, raw, env=None):
         transcript = os.path.expanduser(transcript)
     if not transcript:
         transcript = default_transcript(agent, session, cwd)
-    if not isinstance(transcript, str) or not transcript:
+    if not clearing and (not isinstance(transcript, str) or not transcript):
         return "no transcript: the session can't be resumed"
+    if agent == "omp" and not clearing and (not os.path.isabs(transcript) or "\0" in transcript):
+        return "no absolute transcript path"
 
     agent_pid = find_agent(agent, os.getppid())
     if agent_pid is None and agent == "claude" and str(env.get("CLAUDE_PID", "")).isdigit():
@@ -567,26 +595,158 @@ def hook(agent, raw, env=None):
     if where != "direct":
         return f"agent runs {where}"
     label = read_label(terminal.get("labels"))
+    if clearing:
+        if label and label.get("agent") == agent and label.get("pid") == agent_pid:
+            hc(["label", term, f"{LABEL}="], timeout=HOOK_HC_TIMEOUT)
+        return "saved"
     if (label and label.get("agent") == agent and label.get("session") == session
-            and label.get("pid") == agent_pid and label.get("shell") == shell):
-        return "already noted"
+            and label.get("pid") == agent_pid and label.get("shell") == shell
+            and (agent != "omp" or (label.get("transcript") == transcript and label.get("cwd") == cwd))):
+        return "saved" if agent == "omp" else "already noted"
 
-    remember(term, agent, session, cwd, transcript, agent_pid, shell)
+    if agent == "omp":
+        remember(term, agent, session, cwd, transcript, agent_pid, shell, launch_env=env)
+    else:
+        remember(term, agent, session, cwd, transcript, agent_pid, shell)
     return "saved"
 
 
-def remember(term, agent, session, cwd, transcript, agent_pid, shell, watcher=True, launch_args=None):
+def remember(term, agent, session, cwd, transcript, agent_pid, shell, watcher=True, launch_args=None, launch_env=None,
+             follow_omp=False):
     """Label the terminal with the session (and the agent's launch flags) and start its watcher."""
     label = {"agent": agent, "session": session, "cwd": cwd, "transcript": transcript,
              "pid": agent_pid, "shell": shell, "boot": boot_id(), "at": int(time.time() * 1000)}
     argv = proc_argv(agent_pid) if launch_args is None else None
     if launch_args is not None or argv:
         label["args"] = flat(launch_flags(agent, launch_args if launch_args is not None else argv[1:]))
+    if agent == "omp":
+        source_env = proc_env(agent_pid) if launch_env is None else launch_env
+        label["env"] = {key: source_env.get(key, "") for key in OMP_ENV}
+        label["env"]["OMP_PROFILE"] = source_env.get("OMP_PROFILE", source_env.get("PI_PROFILE", ""))
+        custom_dir = label["env"]["PI_CODING_AGENT_DIR"]
+        if custom_dir and not os.path.isabs(custom_dir):
+            label["env"]["PI_CODING_AGENT_DIR"] = os.path.abspath(os.path.join(source_env.get("PWD") or cwd, custom_dir))
     hc(["label", term, f"{LABEL}={json.dumps(label, separators=(',', ':'), ensure_ascii=False)}"], timeout=HOOK_HC_TIMEOUT)
     if watcher:
-        subprocess.Popen([sys.executable, os.path.abspath(__file__), "watch", term, str(agent_pid), str(shell)],
+        mode = "watch-omp" if follow_omp else "watch"
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), mode, term, str(agent_pid), str(shell)],
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          close_fds=True, start_new_session=True)
+
+
+def proc_env(pid):
+    """Read only storage-selection keys from Linux's launch environment."""
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            entries = f.read().split(b"\0")
+    except OSError:
+        return {}
+    allowed = {*OMP_ENV, "HOME", "PWD"}
+    values = {}
+    for entry in entries:
+        key, sep, value = entry.partition(b"=")
+        name = key.decode("utf-8", "replace")
+        if sep and name in allowed:
+            values[name] = value.decode("utf-8", "replace")
+    return values
+
+
+def omp_breadcrumb_dir(env, args, home):
+    """OMP 18's profile/custom-agent-directory and migrated XDG state layout."""
+    profile = env.get("OMP_PROFILE", env.get("PI_PROFILE", ""))
+    for group in launch_flags("omp", args):
+        if group[0].partition("=")[0] == "--profile":
+            profile = group[1] if len(group) == 2 else group[0].partition("=")[2]
+    profile = profile.strip()
+    if profile == "default":
+        profile = ""
+    if profile and (not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", profile) or profile in (".", "..")):
+        return None
+    root = os.path.normpath(os.path.join(home, (env.get("PI_CONFIG_DIR") or ".omp").lstrip("/")))
+    if profile:
+        root = os.path.join(root, "profiles", profile)
+    default_agent = os.path.join(root, "agent")
+    agent_dir = default_agent
+    if not profile and env.get("PI_CODING_AGENT_DIR"):
+        agent_dir = env["PI_CODING_AGENT_DIR"]
+        if not os.path.isabs(agent_dir):
+            launch_cwd = env.get("PWD", "")
+            if not os.path.isabs(launch_cwd):
+                return None
+            agent_dir = os.path.normpath(os.path.join(launch_cwd, agent_dir))
+    state = env.get("XDG_STATE_HOME")
+    if state and os.path.isabs(state) and agent_dir == default_agent:
+        xdg = os.path.join(state, "omp")
+        if profile:
+            xdg = os.path.join(xdg, "profiles", profile)
+        if os.path.isdir(xdg):
+            agent_dir = xdg
+    return os.path.join(agent_dir, "terminal-sessions")
+
+
+def proc_has_open_file(pid, path):
+    """Match one exact regular file against this process's open descriptors, never their contents."""
+    try:
+        target = os.path.realpath(path)
+        expected = os.stat(target)
+        if not stat.S_ISREG(expected.st_mode):
+            return False
+        with os.scandir(f"/proc/{pid}/fd") as entries:
+            for entry in entries:
+                try:
+                    if os.readlink(entry.path) != target:
+                        continue
+                    opened = os.stat(entry.path)
+                    if (opened.st_dev, opened.st_ino) == (expected.st_dev, expected.st_ino):
+                        return True
+                except OSError:
+                    continue  # Descriptors can close while the process is running.
+    except OSError:
+        pass
+    return False
+
+
+def omp_session_of(pid, home=None, allow_fresh=False):
+    """Exact TTY breadcrumb and header; an allowed fresh boundary has a None session id."""
+    env = proc_env(pid)
+    home = home or env.get("HOME") or os.path.expanduser("~")
+    folder = omp_breadcrumb_dir(env, (proc_argv(pid) or [])[1:], home)
+    if folder is None:
+        return None
+    try:
+        tty = os.readlink(f"/proc/{pid}/fd/0")
+        if not tty.startswith("/dev/") or not stat.S_ISCHR(os.stat(f"/proc/{pid}/fd/0").st_mode):
+            return None
+        breadcrumb = os.path.join(folder, tty[5:].replace("/", "-"))
+        age = shell_age(pid)
+        if age is None:
+            return None
+        stale = os.path.getmtime(breadcrumb) < time.time() - age
+        with open(breadcrumb, encoding="utf-8") as f:
+            cwd, transcript = f.readline(8192).rstrip("\n"), f.readline(8192).rstrip("\n")
+            fresh = "fresh" in f.read(1024).splitlines()
+        if not os.path.isabs(cwd) or not transcript or "\0" in cwd or "\0" in transcript:
+            return None
+        transcript = os.path.normpath(os.path.join(cwd, transcript))
+        if os.path.realpath(cwd) != os.path.realpath(os.readlink(f"/proc/{pid}/cwd")):
+            return None
+        # Recycled TTY names cannot prove ownership. An unchanged breadcrumb from an
+        # explicit resume is safe only when this process still has its exact transcript open.
+        if stale and not proc_has_open_file(pid, transcript):
+            return None
+        if allow_fresh and fresh and not os.path.exists(transcript):
+            return None, cwd, transcript
+        with open(transcript, encoding="utf-8") as f:
+            header = json.loads(f.readline(65536))
+            if isinstance(header, dict) and header.get("type") == "title":
+                header = json.loads(f.readline(65536))
+        if (not isinstance(header, dict) or header.get("type") != "session"
+                or not valid_session(header.get("id")) or not isinstance(header.get("cwd"), str)
+                or os.path.realpath(header["cwd"]) != os.path.realpath(cwd)):
+            return None
+    except (OSError, ValueError):
+        return None
+    return header["id"], cwd, transcript
 
 
 def claude_session_of(pid, home=None):
@@ -608,20 +768,29 @@ def claude_session_of(pid, home=None):
 
 
 def adopt():
-    """Label Claude Code sessions that were already running before the hook was installed.
-    (Codex sessions are picked up the next time they start or resume.)"""
+    """Label running Claude Code and OMP sessions using their exact process registries."""
     adopted, skipped = [], []
     for terminal in gather():
         fg, shell = terminal.get("foreground") or {}, terminal.get("pid")
         agent_pid = fg.get("pid")
-        if not shell or not agent_pid or not (_names(fg.get("name") or "") & AGENTS["claude"]["names"]):
+        agent = next((name for name in ("claude", "omp")
+                      if _names(fg.get("name") or "") & AGENTS[name]["names"]), None)
+        if not shell or not agent_pid or not agent:
             continue
-        item = {"terminal": terminal["address"], "where": (terminal.get("labels") or {}).get("where"), "agent": "claude"}
+        item = {"terminal": terminal["address"], "where": (terminal.get("labels") or {}).get("where"), "agent": agent}
         label = read_label(terminal.get("labels"))
-        if label and label.get("pid") == agent_pid:
+        if agent != "omp" and label and label.get("agent") == agent and label.get("pid") == agent_pid:
             skipped.append({**item, "reason": "already noted"})
             continue
-        found = claude_session_of(agent_pid)
+        if agent == "omp":
+            try:
+                if os.readlink(f"/proc/{agent_pid}/fd/0") != os.readlink(f"/proc/{shell}/fd/0"):
+                    skipped.append({**item, "reason": "agent and shell TTY differ"})
+                    continue
+            except OSError:
+                skipped.append({**item, "reason": "TTY unavailable"})
+                continue
+        found = omp_session_of(agent_pid) if agent == "omp" else claude_session_of(agent_pid)
         if not found:
             skipped.append({**item, "reason": "session not found"})
             continue
@@ -629,20 +798,68 @@ def adopt():
             skipped.append({**item, "reason": "not run by the terminal's shell"})
             continue
         session, cwd, transcript = found
-        remember(terminal["address"], "claude", session, cwd, transcript, agent_pid, shell)
+        if (label and label.get("agent") == agent and label.get("pid") == agent_pid
+                and (label["session"], label["cwd"], label["transcript"]) == found):
+            skipped.append({**item, "reason": "already noted"})
+            continue
+        if agent == "omp":
+            remember(terminal["address"], agent, session, cwd, transcript, agent_pid, shell, follow_omp=True)
+        else:
+            remember(terminal["address"], agent, session, cwd, transcript, agent_pid, shell)
         adopted.append({**item, "session": session})
-        log("adopt", terminal=terminal["address"], agent="claude", session=session)
+        log("adopt", terminal=terminal["address"], agent=agent, session=session)
     return {"adopted": adopted, "skipped": skipped}
 
 
-def watch(term, agent_pid, shell):
+def follow_omp_session(term, agent_pid, shell):
+    """Follow adopted sessions without injecting input or loading code into the running agent."""
+    stamp = _stamp(agent_pid)
+    if stamp is None:
+        return False
+    seen, cleared = None, False
+    while True:
+        current_stamp = _stamp(agent_pid)
+        if current_stamp != stamp:
+            return current_stamp is None
+        found = omp_session_of(agent_pid, allow_fresh=True)
+        if found is not None and found != seen:
+            try:
+                if os.readlink(f"/proc/{agent_pid}/fd/0") != os.readlink(f"/proc/{shell}/fd/0"):
+                    return False
+            except OSError:
+                return False
+            terminal = hc_json(["get", term])
+            if terminal.get("state") != "live" or terminal.get("pid") != shell:
+                return False
+            label = read_label(terminal.get("labels"))
+            if label:
+                if label["agent"] != "omp" or label["pid"] != agent_pid or label["shell"] != shell:
+                    return False
+            elif not cleared:
+                return False
+            session, cwd, transcript = found
+            if session is None:
+                hc(["label", term, f"{LABEL}="], timeout=HOOK_HC_TIMEOUT)
+                cleared = True
+            elif not label or (label["session"], label["cwd"], label["transcript"]) != found:
+                remember(term, "omp", session, cwd, transcript, agent_pid, shell, watcher=False)
+                cleared = False
+            seen = found
+        time.sleep(2)
+
+
+def watch(term, agent_pid, shell, follow_omp=False):
     """Runs detached beside an agent. When the agent exits and its terminal's program is
     still the same one, the person quit it: forget the session. When the terminal went
     with it (reboot, logout, core restart, pane closed), keep it for `resume`."""
     lock = runtime_lock(f"watch-{agent_pid}")
     if lock is None:
         return "already watched"
-    wait_exit(agent_pid)
+    if follow_omp:
+        if not follow_omp_session(term, agent_pid, shell):
+            return "a newer session took over"
+    else:
+        wait_exit(agent_pid)
     time.sleep(EXIT_GRACE)
     if not alive(shell):
         return "terminal went with it"
@@ -686,7 +903,11 @@ def resume_argv(label, typable_only=False):
     groups = launch_flags(label["agent"], label.get("args") or [])
     if typable_only:
         groups = [g for g in groups if all(TYPABLE_ARG_RE.match(a) for a in g)]
-    return AGENTS[label["agent"]]["argv"](label["session"]) + flat(groups)
+    target = label["transcript"] if label["agent"] == "omp" else label["session"]
+    argv = AGENTS[label["agent"]]["argv"](target) + flat(groups)
+    if label["agent"] == "omp" and label.get("env"):
+        argv = ["env", *[f"{key}={value}" for key, value in label["env"].items()], *argv]
+    return argv
 
 
 def _quote(arg):
@@ -697,6 +918,9 @@ def command(label):
     """What to type, or None when the folder can't be typed safely."""
     cwd = label.get("cwd")
     if not isinstance(cwd, str) or not TYPABLE_PATH_RE.match(cwd):
+        return None
+    if label["agent"] == "omp" and (not TYPABLE_PATH_RE.match(label["transcript"])
+            or any(not TYPABLE_ARG_RE.match(value) for value in label.get("env", {}).values())):
         return None
     if label["agent"] == "kiro":
         script = os.path.abspath(__file__)
@@ -1126,13 +1350,13 @@ def main(argv):
         # shows it to nobody. Every other agent would treat stdout as context, so stay quiet.
         if agent == "agy":
             sys.stdout.write("{}\n")
-        elif agent == "pi":
+        elif agent in ("pi", "omp"):
             sys.stdout.write(outcome + "\n")
         return 0
-    if command_name == "watch":
+    if command_name in ("watch", "watch-omp"):
         term, agent_pid, shell = argv[2], int(argv[3]), int(argv[4])
         try:
-            outcome = watch(term, agent_pid, shell)
+            outcome = watch(term, agent_pid, shell, follow_omp=command_name == "watch-omp")
         except Exception as error:
             outcome = f"error: {error}"
         if outcome.startswith(("forgot", "error")):

@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+import shlex
 import importlib.util
 import json
 import multiprocessing
@@ -646,6 +648,229 @@ class ClaudeRegistryTests(unittest.TestCase):
             Path(home, ".claude", "sessions", "40.json").write_text(json.dumps(
                 {"pid": 40, "sessionId": SID, "cwd": "/work", "kind": "background"}))
             self.assertIsNone(ar.claude_session_of(40, home))
+
+
+class OmpTests(unittest.TestCase):
+    @contextmanager
+    def running(self, saved=None, nested=False, env=None):
+        current = terminal(address="t7", pid=30, fg_pid=40, fg_name="omp", lbl=saved)
+        tree = {30: {"ppid": 1, "names": {"zsh"}},
+                40: {"ppid": 30, "names": {"omp"}},
+                70: {"ppid": 40, "names": {"bash"}},
+                90: {"ppid": 70, "names": {"omp"}}}
+
+        def save(args, **_kwargs):
+            if args[0] == "label":
+                current["labels"][ar.LABEL] = args[2].split("=", 1)[1]
+            return ""
+
+        with mock.patch.object(ar, "_proc_linux", side_effect=tree.get), \
+             mock.patch.object(ar.os, "getppid", return_value=90 if nested else 40), \
+             mock.patch.object(ar, "proc_argv", return_value=["omp", "--restore", "/old.jsonl", "do work"]), \
+             mock.patch.object(ar, "hc_json", return_value=current), \
+             mock.patch.object(ar, "hc", side_effect=save), \
+             mock.patch.object(ar.subprocess, "Popen"), \
+             mock.patch.object(ar, "boot_id", return_value=BOOT):
+            yield current, {"HC_TERMINAL_ID": "t7", **(env or {})}
+
+    def start(self, session=SID, path="/sessions/first.jsonl", cwd="/work"):
+        return json.dumps({"hook_event_name": "SessionStart", "session_id": session,
+                           "transcript_path": path, "cwd": cwd})
+
+    def test_resume_uses_exact_file_and_never_replays_work(self):
+        saved = {**label(agent="omp"), "transcript": "/sessions/a b.jsonl", "args": [
+            "--restore", "/old.jsonl", "--continue", "--goal", "finish it", "--plan-yolo",
+            "--model", "test/model", "--profile=work", "--config", "/settings.yml",
+            "--extension", "/hook.js", "positional work", "--mode", "json", "-p", "@task.txt"]}
+        expected = ["omp", "--resume", "/sessions/a b.jsonl", "--model", "test/model",
+                    "--profile=work", "--config", "/settings.yml", "--extension", "/hook.js"]
+        self.assertEqual(ar.resume_argv(saved), expected)
+        self.assertEqual(shlex.split(ar.command(saved))[3:], expected)
+        for path in ("/sessions/it's.jsonl", "/sessions/new\nline.jsonl"):
+            self.assertIsNone(ar.command({**saved, "transcript": path}))
+
+    def test_first_turn_switch_branch_and_empty_new_replace_old_label(self):
+        with self.running() as (current, env):
+            # The first allocated file may not exist yet. A reboot must never choose an older session.
+            self.assertEqual(ar.hook("omp", self.start(), env=env), "saved")
+            saved = ar.read_label(current["labels"])
+            self.assertEqual((saved["session"], saved["transcript"]), (SID, "/sessions/first.jsonl"))
+            self.assertEqual(ar.hook("omp", self.start(SID2, "/sessions/branch.jsonl"), env=env), "saved")
+            self.assertEqual(ar.read_label(current["labels"])["session"], SID2)
+            # Moving the same identity must update the exact path and working directory too.
+            self.assertEqual(ar.hook("omp", self.start(SID2, "/new/path.jsonl", "/new"), env=env), "saved")
+            saved = ar.read_label(current["labels"])
+            self.assertEqual((saved["transcript"], saved["cwd"]), ("/new/path.jsonl", "/new"))
+            self.assertEqual(ar.hook("omp", '{"hook_event_name":"SessionClear"}', env=env), "saved")
+            self.assertIsNone(ar.read_label(current["labels"]))
+
+    def test_nested_omp_cannot_replace_or_clear_outer_session(self):
+        original = label(agent="omp", pid=40, shell=30)
+        with self.running(original, nested=True) as (current, env):
+            for payload in (self.start(SID2), '{"hook_event_name":"SessionClear"}'):
+                self.assertEqual(ar.hook("omp", payload, env=env), "agent runs nested")
+                self.assertEqual(ar.read_label(current["labels"])["session"], SID)
+
+    def test_clear_does_not_erase_another_agent_or_process(self):
+        for original in (label(agent="claude", pid=40, shell=30), label(agent="omp", pid=99, shell=30)):
+            with self.running(original) as (current, env):
+                ar.hook("omp", '{"hook_event_name":"SessionClear"}', env=env)
+                saved = ar.read_label(current["labels"])
+                self.assertEqual((saved["agent"], saved["pid"]), (original["agent"], original["pid"]))
+
+    def test_storage_environment_survives_resume_without_capturing_secrets(self):
+        with self.running(env={"PI_PROFILE": "work", "PI_CODING_AGENT_DIR": "custom",
+                               "PWD": "/launch", "API_KEY": "synthetic-secret"}) as (current, env):
+            ar.hook("omp", self.start(), env=env)
+            saved = ar.read_label(current["labels"])
+            self.assertEqual(saved["env"]["OMP_PROFILE"], "work")
+            self.assertEqual(saved["env"]["PI_CODING_AGENT_DIR"], "/launch/custom")
+            self.assertNotIn("API_KEY", saved["env"])
+            command = shlex.split(ar.command(saved))
+            self.assertIn("OMP_PROFILE=work", command)
+            self.assertIn("PI_CODING_AGENT_DIR=/launch/custom", command)
+            self.assertEqual(command[-3:], ["omp", "--resume", "/sessions/first.jsonl"])
+            saved["env"]["LD_PRELOAD"] = "/untrusted.so"
+            self.assertIsNone(ar.read_label({ar.LABEL: json.dumps(saved)}))
+
+    def test_missing_transcript_never_falls_back_to_latest(self):
+        saved = label(agent="omp", shell=100)
+        restored = terminal(pid=300, fg_name="zsh", lbl=saved)
+        todo, skipped = run_plan([restored], file_ok=lambda _: False)
+        self.assertEqual(todo, [])
+        self.assertEqual(skipped[0]["reason"], "no saved conversation to resume")
+        self.assertIsNone(ar.decide_here(restored, 300, BOOT, folder_ok=lambda _: True,
+                                       file_ok=lambda _: False)[0])
+
+    def test_adopted_watcher_tracks_switches_and_fresh_boundaries(self):
+        original = label(agent="omp", pid=40, shell=30)
+        mappings = [(SID, "/work", original["transcript"]),
+                    (SID2, "/work", "/sessions/switched.jsonl"),
+                    (None, "/work", "/sessions/new.jsonl"),
+                    (SID, "/work", "/sessions/new.jsonl")]
+        observed = []
+        with self.running(original) as (current, _env):
+            def observe(_seconds):
+                saved = ar.read_label(current["labels"])
+                observed.append((saved["session"], saved["cwd"], saved["transcript"]) if saved else None)
+
+            with mock.patch.object(ar, "_stamp", side_effect=["40 start"] * 5 + [None]), \
+                 mock.patch.object(ar, "omp_session_of", side_effect=mappings), \
+                 mock.patch.object(ar, "proc_env", return_value={}), \
+                 mock.patch.object(ar.os, "readlink", return_value="/dev/pts/123"), \
+                 mock.patch.object(ar.time, "sleep", side_effect=observe):
+                self.assertTrue(ar.follow_omp_session("t7", 40, 30))
+        self.assertEqual(observed, [mappings[0], mappings[1], None, mappings[3]])
+
+    def test_adopted_watcher_stops_before_overwriting_new_owner(self):
+        original = label(agent="omp", pid=99, shell=30)
+        with self.running(original) as (current, _env), \
+             mock.patch.object(ar, "_stamp", return_value="40 start"), \
+             mock.patch.object(ar, "omp_session_of", return_value=(SID2, "/work", "/new.jsonl")), \
+             mock.patch.object(ar.os, "readlink", return_value="/dev/pts/123"):
+            self.assertFalse(ar.follow_omp_session("t7", 40, 30))
+            self.assertEqual(ar.read_label(current["labels"])["pid"], 99)
+
+    def test_adopted_watcher_does_not_treat_recycled_pid_as_normal_exit(self):
+        with mock.patch.object(ar, "_stamp", side_effect=["40 old", "40 new"]):
+            self.assertFalse(ar.follow_omp_session("t7", 40, 30))
+
+class OmpAdoptionTests(unittest.TestCase):
+    @contextmanager
+    def registry(self):
+        with tempfile.TemporaryDirectory() as home:
+            cwd = str(Path(home, "work"))
+            Path(cwd).mkdir()
+            folder = Path(home, ".omp", "agent", "terminal-sessions")
+            folder.mkdir(parents=True)
+            transcript = Path(home, "session.jsonl")
+            header = {"type": "session", "version": 3, "id": SID, "cwd": cwd}
+            transcript.write_text(json.dumps({"type": "title", "title": "synthetic"}) + "\n"
+                                  + json.dumps(header) + "\nnot JSON; body must never be read\n")
+            breadcrumb = folder / "pts-123"
+            breadcrumb.write_text(f"{cwd}\n{transcript}\n")
+            real_stat = os.stat
+            real_readlink = os.readlink
+
+            def process_readlink(path, *args, **kwargs):
+                targets = {"/proc/40/fd/0": "/dev/pts/123", "/proc/40/cwd": cwd}
+                if str(path) in targets:
+                    return targets[str(path)]
+                return real_readlink(path, *args, **kwargs)
+
+            def process_stat(path, *args, **kwargs):
+                if str(path) == "/proc/40/fd/0":
+                    return mock.Mock(st_mode=ar.stat.S_IFCHR)
+                return real_stat(path, *args, **kwargs)
+
+            with mock.patch.object(ar, "proc_env", return_value={"HOME": home}), \
+                 mock.patch.object(ar, "proc_argv", return_value=["omp"]), \
+                 mock.patch.object(ar, "shell_age", return_value=60), \
+                 mock.patch.object(ar.os, "readlink", side_effect=process_readlink), \
+                 mock.patch.object(ar.os, "stat", side_effect=process_stat):
+                yield home, cwd, transcript, breadcrumb, header
+
+    def test_adopts_only_exact_tty_header_without_reading_body(self):
+        with self.registry() as (home, cwd, transcript, breadcrumb, _header):
+            self.assertEqual(ar.omp_session_of(40, home), (SID, cwd, str(transcript)))
+            other = breadcrumb.with_name("pts-124")
+            breadcrumb.rename(other)
+            self.assertIsNone(ar.omp_session_of(40, home))
+
+    def test_rejects_recycled_tty_wrong_header_and_missing_lazy_session(self):
+        with self.registry() as (home, _cwd, transcript, breadcrumb, header):
+            os.utime(breadcrumb, (time.time() - 120, time.time() - 120))
+            self.assertIsNone(ar.omp_session_of(40, home))
+            os.utime(breadcrumb, None)
+            transcript.write_text(json.dumps({**header, "cwd": "/another-workspace"}) + "\n")
+            self.assertIsNone(ar.omp_session_of(40, home))
+            transcript.unlink()
+            self.assertIsNone(ar.omp_session_of(40, home))
+
+    @unittest.skipUnless(Path("/proc/self/fd").is_dir(), "Linux /proc required")
+    def test_stale_breadcrumb_requires_exact_open_transcript_not_advisor(self):
+        real_scandir = os.scandir
+
+        def process_descriptors(path):
+            return real_scandir("/proc/self/fd" if str(path) == "/proc/40/fd" else path)
+
+        with self.registry() as (home, cwd, transcript, breadcrumb, header), \
+             mock.patch.object(ar.os, "scandir", side_effect=process_descriptors):
+            os.utime(breadcrumb, (time.time() - 120, time.time() - 120))
+            advisor = transcript.with_name("__advisor.jsonl")
+            advisor.write_text(json.dumps(header) + "\n")
+            with advisor.open():
+                self.assertIsNone(ar.omp_session_of(40, home))
+                with transcript.open():
+                    self.assertEqual(ar.omp_session_of(40, home), (SID, cwd, str(transcript)))
+                    transcript.write_text(json.dumps({**header, "cwd": "/another-workspace"}) + "\n")
+                    self.assertIsNone(ar.omp_session_of(40, home))
+                transcript.write_text(json.dumps(header) + "\n")
+                self.assertIsNone(ar.omp_session_of(40, home))
+
+    def test_only_explicit_fresh_missing_breadcrumb_can_clear_old_session(self):
+        with self.registry() as (home, cwd, transcript, breadcrumb, _header):
+            transcript.unlink()
+            self.assertIsNone(ar.omp_session_of(40, home, allow_fresh=True))
+            breadcrumb.write_text(f"{cwd}\n{transcript}\nfresh\n")
+            self.assertEqual(ar.omp_session_of(40, home, allow_fresh=True), (None, cwd, str(transcript)))
+            self.assertIsNone(ar.omp_session_of(40, home))
+
+    def test_profile_custom_directory_and_xdg_select_correct_registry(self):
+        with tempfile.TemporaryDirectory() as home:
+            root = Path(home, ".omp")
+            self.assertEqual(ar.omp_breadcrumb_dir({"PI_CODING_AGENT_DIR": "/custom"}, [], home),
+                             "/custom/terminal-sessions")
+            self.assertEqual(ar.omp_breadcrumb_dir({"PI_CODING_AGENT_DIR": "/custom", "PI_PROFILE": "old"},
+                                                   ["--profile=work"], home),
+                             str(root / "profiles/work/agent/terminal-sessions"))
+            self.assertEqual(ar.omp_breadcrumb_dir({"OMP_PROFILE": "", "PI_PROFILE": "old"}, [], home),
+                             str(root / "agent/terminal-sessions"))
+            xdg = Path(home, "state")
+            profile = xdg / "omp/profiles/work"
+            profile.mkdir(parents=True)
+            self.assertEqual(ar.omp_breadcrumb_dir({"OMP_PROFILE": "work", "XDG_STATE_HOME": str(xdg)}, [], home),
+                             str(profile / "terminal-sessions"))
 
 
 if __name__ == "__main__":

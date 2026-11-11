@@ -7,10 +7,11 @@
   Claude Code (~/.claude/settings.json), Codex (~/.codex/hooks.json),
   Grok (~/.grok/hooks/agent-resume.json), Antigravity (~/.gemini/config/hooks.json),
   Kiro V3 (~/.kiro/hooks/agent-resume.json).
-  Pi gets an extension in ~/.pi/agent/extensions/;
-- notes Claude Code sessions that are already running (`agent_resume.py adopt`);
+  Pi and OMP get session extensions;
+- notes Claude Code and OMP sessions that are already running (`agent_resume.py adopt`);
 - with `--auto`, adds a few lines to fish, bash and zsh's startup files so a restored
   terminal starts its agent again by itself (`--no-auto` takes them out).
+- with `--agents`, also prepares hooks for named agents before their first launch.
 
 No layout change is needed. `--uninstall` takes all of it out again.
 """
@@ -231,7 +232,7 @@ def write_text(path, text):
     temp.replace(path)
 
 
-def apply_shell(changes):
+def apply_text_changes(changes):
     for path, text in changes:
         if text is None:
             path.unlink(missing_ok=True)
@@ -336,30 +337,40 @@ def vacant(config):
     return hooks in (None, {}, [])
 
 
-def pi_extension(script):
-    template = (ROOT / "scripts" / "pi_extension.js").read_text()
+def _render_extension(filename, script, description):
+    """Render the installed helper path consistently for each agent extension."""
+    template = (ROOT / "scripts" / filename).read_text()
     if "__SCRIPT__" not in template:
-        raise ValueError("pi extension template has no __SCRIPT__ placeholder")
+        raise ValueError(f"{description} template has no __SCRIPT__ placeholder")
     return template.replace("__SCRIPT__", json.dumps(str(script)))
 
 
-def pi_changes(home, script, remove):
-    """(path, new text or None to delete) for Pi's extension, when Pi is set up here."""
-    agent = home / ".pi" / "agent"
-    if not agent.is_dir():
-        return []
-    path = agent / "extensions" / "herdr-agent-resume.js"
-    if remove:
-        if path.is_file() and "herdr-agent-resume pi session hook" in path.read_text():
-            return [(path, None)]
-        return []
-    text = pi_extension(script)
-    if path.is_file() and path.read_text() == text:
-        return []
-    return [(path, text)]
+def extension_changes(home, script, remove, enabled=()):
+    """Install session extensions without replacing an unrelated user's file."""
+    roots = [("pi", home / ".pi" / "agent"), ("omp", home / ".omp" / "agent")]
+    roots.extend(("omp", root) for root in sorted((home / ".omp" / "profiles").glob("*/agent")))
+    changes = []
+    for name, root in roots:
+        if not root.is_dir() and name not in enabled:
+            continue
+        path = root / "extensions" / "herdr-agent-resume.js"
+        marker = f"herdr-agent-resume {name} session hook"
+        old = path.read_text() if path.exists() else None
+        if old is not None and marker not in old:
+            if remove:
+                continue
+            raise ValueError(f"Extension belongs to another source: {path}. No files changed.")
+        if remove:
+            if old is not None:
+                changes.append((path, None))
+            continue
+        text = _render_extension(f"{name}_extension.js", script, f"{name} extension")
+        if old != text:
+            changes.append((path, text))
+    return changes
 
 
-def agent_configs(home):
+def agent_configs(home, enabled=()):
     """(name, path, existing config, kind) for each agent that is set up on this machine.
 
     `kind` is how that file lists hooks: "group" (Claude's SessionStart groups),
@@ -373,7 +384,7 @@ def agent_configs(home):
     )
     out = []
     for name, folder, file, kind in specs:
-        if not (home / folder).is_dir():
+        if not (home / folder).is_dir() and name not in enabled:
             continue
         path = home / folder / file
         config = json.loads(path.read_text()) if path.exists() else {}
@@ -386,10 +397,12 @@ def agent_configs(home):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--app-home", type=Path, default=Path(os.environ.get("HERDR_APP_HOME", Path.home() / ".config/herdr-app")))
-    parser.add_argument("--home", type=Path, default=Path.home(), help="where ~/.claude, ~/.codex, ~/.grok, ~/.gemini, ~/.pi and ~/.kiro live")
+    parser.add_argument("--home", type=Path, default=Path.home(), help="home containing agent configuration directories")
+    parser.add_argument("--agents", nargs="+", choices=("claude", "codex", "grok", "agy", "pi", "kiro", "omp"),
+                        default=(), help="also prepare hooks for these agents before their first launch")
     parser.add_argument("--update", action="store_true", help="update files previously installed by this script")
     parser.add_argument("--uninstall", action="store_true")
-    parser.add_argument("--no-adopt", action="store_true", help="don't note Claude Code sessions already running")
+    parser.add_argument("--no-adopt", action="store_true", help="don't note agent sessions already running")
     parser.add_argument("--auto", action="store_true", help="restored terminals start their agent again by themselves (fish, bash, zsh)")
     parser.add_argument("--no-auto", action="store_true", help="take the startup lines --auto added out again")
     parser.add_argument("--dry-run", action="store_true")
@@ -402,12 +415,12 @@ def main():
     source = ROOT / "mods" / MOD_NAME
     destination = app / "mods" / MOD_NAME
     script = destination / "agent_resume.py"
-    configs = agent_configs(home)
+    configs = agent_configs(home, args.agents)
     if args.auto and args.no_auto:
         raise ValueError("--auto and --no-auto can't go together")
     mode = "remove" if args.uninstall or args.no_auto else "add" if args.auto else "refresh"
     shells = shell_changes(home, script, mode)
-    pi = pi_changes(home, script, args.uninstall)
+    extensions = extension_changes(home, script, args.uninstall, args.agents)
 
     if args.uninstall:
         keys = remove_keys(json.loads(keys_path.read_text()), snippet)
@@ -426,8 +439,8 @@ def main():
     print(f"Mod: {destination}\nShortcut: Ctrl+Shift+R")
     for path, _ in changes:
         print(f"Hook: {path}")
-    for path, text in pi:
-        print(f"{'Pi extension removed' if text is None else 'Pi extension'}: {path}")
+    for path, text in extensions:
+        print(f"{'Extension removed' if text is None else 'Extension'}: {path}")
     for path, text in shells:
         print(f"{'Startup lines removed' if text is None or BEGIN not in text else 'Startup lines'}: {path}")
     hooked = {name for name, _, _, _ in configs}
@@ -442,9 +455,11 @@ def main():
     for name, path, _, _ in configs:
         if path.exists():
             shutil.copy2(path, backup / f"{name}-{path.name}")
-    for path, _ in pi:
+    for path, _ in extensions:
         if path.exists():
-            shutil.copy2(path, backup / f"pi-{path.name}")
+            saved = backup / "extensions" / path.relative_to(home)
+            saved.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, saved)
     for path, _ in shells:
         if path.exists():
             shutil.copy2(path, backup / f"shell-{path.name.lstrip('.')}")
@@ -455,8 +470,8 @@ def main():
         for path, config in changes:
             write_hook(path, config)
         atomic_json(keys_path, keys)
-        apply_shell(pi)
-        apply_shell(shells)
+        apply_text_changes(extensions)
+        apply_text_changes(shells)
         if destination.exists():
             shutil.rmtree(destination)
         print(f"Uninstalled. Backup: {backup}")
@@ -480,8 +495,8 @@ def main():
         atomic_json(keys_path, keys)
         for path, config in changes:
             write_hook(path, config)
-        apply_shell(pi)
-        apply_shell(shells)
+        apply_text_changes(extensions)
+        apply_text_changes(shells)
     except Exception:
         if replaced and destination.exists():
             shutil.rmtree(destination)
@@ -492,10 +507,10 @@ def main():
             saved = backup / f"{name}-{path.name}"
             if saved.exists():
                 shutil.copy2(saved, path)
-            elif path.name == "agent-resume.json":
+            else:
                 path.unlink(missing_ok=True)
-        for path, _ in pi:
-            saved = backup / f"pi-{path.name}"
+        for path, _ in extensions:
+            saved = backup / "extensions" / path.relative_to(home)
             if saved.exists():
                 path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(saved, path)
@@ -520,7 +535,7 @@ def main():
                                  capture_output=True, text=True)
         try:
             for item in json.loads(adopted.stdout).get("adopted", []):
-                print(f"Noted the running Claude Code session in {item['where'] or item['terminal']}")
+                print(f"Noted the running {item['agent']} session in {item['where'] or item['terminal']}")
         except ValueError:
             print(f"Couldn't note running sessions: {(adopted.stderr or adopted.stdout).strip()}")
     if "codex" in hooked and any(path.parent.name == ".codex" for path, _ in changes):

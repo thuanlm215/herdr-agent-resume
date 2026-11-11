@@ -58,6 +58,8 @@ these from inside a Herdr terminal, or `hc` talks to your real core.
 - `scripts/install.py`: the installer, including the shell startup lines for
   `--auto`. Its `FILES` list must name every file in `mods/agent-resume/`
   (CI checks this).
+- `scripts/omp_extension.js`: main interactive OMP session events. The extension
+  consumes helper acknowledgments privately, not as agent context.
 - `RECIPE.md`, `preview.png`: the herdr.dev listing. Keep them in step with
   what the mod does.
 
@@ -84,7 +86,9 @@ Some guidelines:
 - No network requests, and no changes to files outside the app home,
   `~/.claude/settings.json`, `~/.codex/hooks.json`, `~/.grok/hooks/agent-resume.json`,
   `~/.gemini/config/hooks.json`, `~/.kiro/hooks/agent-resume.json`,
-  `~/.pi/agent/extensions/herdr-agent-resume.js` and (with `--auto`) the
+  `~/.pi/agent/extensions/herdr-agent-resume.js`,
+  `~/.omp/agent/extensions/herdr-agent-resume.js`,
+  `~/.omp/profiles/*/agent/extensions/herdr-agent-resume.js` and (with `--auto`) the
   shell startup files, always backed up first.
 - Update `README.md` and `RECIPE.md` when users would notice the change.
 
