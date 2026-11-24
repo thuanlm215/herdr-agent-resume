@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 ROOT = Path(__file__).resolve().parents[1]
 MOD_NAME = "agent-resume"
 PACKAGE = "herdr-agent-resume"
-VERSION = "0.4.2"
+VERSION = "0.5.0"
 MARKER = ".agent-resume-install.json"
 FILES = ("main.js", "summary.js", "mod.json", "agent_resume.py")
 GENERATED = {"gpui-kit.d.ts", "jsconfig.json", "__pycache__"}
@@ -359,6 +359,29 @@ def pi_changes(home, script, remove):
     return [(path, text)]
 
 
+def opencode_plugin(script):
+    template = (ROOT / "scripts" / "opencode_plugin.js").read_text()
+    if "__SCRIPT__" not in template:
+        raise ValueError("opencode plugin template has no __SCRIPT__ placeholder")
+    return template.replace("__SCRIPT__", json.dumps(str(script)))
+
+
+def opencode_changes(home, script, remove):
+    """(path, new text or None to delete) for OpenCode's plugin, when OpenCode is set up here."""
+    config = home / ".config" / "opencode"
+    if not config.is_dir():
+        return []
+    path = config / "plugins" / "herdr-agent-resume.js"
+    if remove:
+        if path.is_file() and "herdr-agent-resume opencode session hook" in path.read_text():
+            return [(path, None)]
+        return []
+    text = opencode_plugin(script)
+    if path.is_file() and path.read_text() == text:
+        return []
+    return [(path, text)]
+
+
 def agent_configs(home):
     """(name, path, existing config, kind) for each agent that is set up on this machine.
 
@@ -370,6 +393,7 @@ def agent_configs(home):
         ("grok", ".grok", "hooks/agent-resume.json", "group"),
         ("agy", ".gemini", "config/hooks.json", "agy"),
         ("kiro", ".kiro", "hooks/agent-resume.json", "kiro"),
+        ("devin", ".config/devin", "config.json", "group"),
     )
     out = []
     for name, folder, file, kind in specs:
@@ -386,7 +410,7 @@ def agent_configs(home):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--app-home", type=Path, default=Path(os.environ.get("HERDR_APP_HOME", Path.home() / ".config/herdr-app")))
-    parser.add_argument("--home", type=Path, default=Path.home(), help="where ~/.claude, ~/.codex, ~/.grok, ~/.gemini, ~/.pi and ~/.kiro live")
+    parser.add_argument("--home", type=Path, default=Path.home(), help="where ~/.claude, ~/.codex, ~/.grok, ~/.gemini, ~/.pi, ~/.kiro and ~/.config/devin live")
     parser.add_argument("--update", action="store_true", help="update files previously installed by this script")
     parser.add_argument("--uninstall", action="store_true")
     parser.add_argument("--no-adopt", action="store_true", help="don't note Claude Code sessions already running")
@@ -408,6 +432,7 @@ def main():
     mode = "remove" if args.uninstall or args.no_auto else "add" if args.auto else "refresh"
     shells = shell_changes(home, script, mode)
     pi = pi_changes(home, script, args.uninstall)
+    oc = opencode_changes(home, script, args.uninstall)
 
     if args.uninstall:
         keys = remove_keys(json.loads(keys_path.read_text()), snippet)
@@ -428,6 +453,8 @@ def main():
         print(f"Hook: {path}")
     for path, text in pi:
         print(f"{'Pi extension removed' if text is None else 'Pi extension'}: {path}")
+    for path, text in oc:
+        print(f"{'OpenCode plugin removed' if text is None else 'OpenCode plugin'}: {path}")
     for path, text in shells:
         print(f"{'Startup lines removed' if text is None or BEGIN not in text else 'Startup lines'}: {path}")
     hooked = {name for name, _, _, _ in configs}
@@ -445,6 +472,9 @@ def main():
     for path, _ in pi:
         if path.exists():
             shutil.copy2(path, backup / f"pi-{path.name}")
+    for path, _ in oc:
+        if path.exists():
+            shutil.copy2(path, backup / f"oc-{path.name}")
     for path, _ in shells:
         if path.exists():
             shutil.copy2(path, backup / f"shell-{path.name.lstrip('.')}")
@@ -456,6 +486,7 @@ def main():
             write_hook(path, config)
         atomic_json(keys_path, keys)
         apply_shell(pi)
+        apply_shell(oc)
         apply_shell(shells)
         if destination.exists():
             shutil.rmtree(destination)
@@ -481,6 +512,7 @@ def main():
         for path, config in changes:
             write_hook(path, config)
         apply_shell(pi)
+        apply_shell(oc)
         apply_shell(shells)
     except Exception:
         if replaced and destination.exists():
@@ -494,13 +526,14 @@ def main():
                 shutil.copy2(saved, path)
             elif path.name == "agent-resume.json":
                 path.unlink(missing_ok=True)
-        for path, _ in pi:
-            saved = backup / f"pi-{path.name}"
-            if saved.exists():
-                path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(saved, path)
-            else:
-                path.unlink(missing_ok=True)
+        for prefix, group in (("pi", pi), ("oc", oc)):
+            for path, _ in group:
+                saved = backup / f"{prefix}-{path.name}"
+                if saved.exists():
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(saved, path)
+                else:
+                    path.unlink(missing_ok=True)
         for path, _ in shells:
             saved = backup / f"shell-{path.name.lstrip('.')}"
             if saved.exists():

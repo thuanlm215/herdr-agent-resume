@@ -128,14 +128,32 @@ class OtherAgentHookTests(unittest.TestCase):
             installer.apply_shell(removed)
             self.assertFalse(path.exists())
 
+    def test_opencode_plugin_points_at_the_script(self):
+        text = installer.opencode_plugin("/app/mods/agent-resume/agent_resume.py")
+        self.assertIn('"/app/mods/agent-resume/agent_resume.py"', text)
+        self.assertNotIn("__SCRIPT__", text)
+        self.assertIn('hook", "opencode"', text)
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".config" / "opencode").mkdir(parents=True)
+            added = installer.opencode_changes(home, "/app/mods/agent-resume/agent_resume.py", False)
+            installer.apply_shell(added)
+            path = home / ".config" / "opencode" / "plugins" / "herdr-agent-resume.js"
+            self.assertEqual(path.read_text(), text)
+            self.assertEqual(installer.opencode_changes(home, "/app/mods/agent-resume/agent_resume.py", False), [])
+            removed = installer.opencode_changes(home, "/app/mods/agent-resume/agent_resume.py", True)
+            installer.apply_shell(removed)
+            self.assertFalse(path.exists())
+
     def test_only_agents_set_up_on_this_machine(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             (home / ".grok").mkdir()
             (home / ".gemini" / "config").mkdir(parents=True)
             (home / ".kiro").mkdir()
+            (home / ".config" / "devin").mkdir(parents=True)
             found = {name: kind for name, _, _, kind in installer.agent_configs(home)}
-            self.assertEqual(found, {"grok": "group", "agy": "agy", "kiro": "kiro"})
+            self.assertEqual(found, {"grok": "group", "agy": "agy", "kiro": "kiro", "devin": "group"})
 
 
 class ShellTests(unittest.TestCase):

@@ -183,6 +183,10 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(ar.command(label(agent="pi")), f"cd '/work' && pi --session {SID}")
         self.assertTrue(ar.command(label(agent="kiro", session="sess_0123abcd")).endswith("launch-kiro sess_0123abcd"))
         self.assertTrue(ar.valid_session("custom.id_1"))
+        self.assertEqual(ar.command(label(agent="devin", session="tasteful-dolomite")),
+                         f"cd '/work' && devin --resume tasteful-dolomite")
+        self.assertEqual(ar.command(label(agent="opencode", session="ses_0123abcd")),
+                         "cd '/work' && opencode --session ses_0123abcd")
 
     def test_refuses_folders_that_cannot_be_typed_safely(self):
         for cwd in ("/it's", "/back\\slash", "/new\nline", "relative", "", None):
@@ -201,6 +205,13 @@ class FlagTests(unittest.TestCase):
                 "-s", "workspace-write", "--model=o3", "-i", "shot.png", "--cd", "/x"]
         self.assertEqual(ar.launch_flags("codex", argv), [["-m", "gpt-5"], ["-c", "model_reasoning_effort=high"],
                                                           ["-s", "workspace-write"], ["--model=o3"]])
+
+    def test_keeps_devin_and_opencode_launch_flags(self):
+        argv = ["--model", "opus", "--sandbox", "--resume", "x", "--permission-mode=plan", "--cloud"]
+        self.assertEqual(ar.launch_flags("devin", argv), [["--model", "opus"], ["--sandbox"],
+                                                           ["--permission-mode=plan"], ["--cloud"]])
+        argv = ["-m", "gpt-5", "--session", "ses_x", "run", "hi"]
+        self.assertEqual(ar.launch_flags("opencode", argv), [["-m", "gpt-5"]])
 
     def test_edge_cases(self):
         self.assertEqual(ar.launch_flags("claude", ["--model"]), [])                     # no value
@@ -570,6 +581,20 @@ class HookTests(unittest.TestCase):
                                                     "cwd": "/work"}), env=self.ENV), "subagent")
         self.assertIsNone(ar.default_transcript("claude", SID, "/work"))
         self.assertIsNone(ar.default_transcript("pi", SID, "/work"))
+
+    def test_devin_and_opencode_payloads(self):
+        outcome, remember = self.saved("devin", json.dumps({
+            "hook_event_name": "SessionStart", "session_id": "tasteful-dolomite", "cwd": "/work",
+            "source": "startup"}))
+        self.assertEqual(outcome, "saved")
+        remember.assert_called_once()
+        self.assertTrue(remember.call_args[0][4].endswith(os.path.join("cli", "transcripts", "tasteful-dolomite.json")))
+
+        outcome, remember = self.saved("opencode", json.dumps({
+            "hook_event_name": "SessionStart", "session_id": "ses_0123abcd", "cwd": "/work"}))
+        self.assertEqual(outcome, "saved")
+        remember.assert_called_once()
+        self.assertTrue(remember.call_args[0][4].endswith("opencode.db"))
 
     def test_a_repeat_of_the_same_session_does_not_note_it_again(self):
         lbl = label(agent="agy", shell=30, pid=40)

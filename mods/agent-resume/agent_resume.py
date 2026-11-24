@@ -6,7 +6,7 @@ restart) back as a shell in its last folder, but never runs the program again.
 This brings agent sessions back, the way the Herdr TUI did:
 
   hook <agent>        note the session on its terminal (an `agent-resume` label
-                      kept by herdr-core). Agents: claude, codex, grok, agy, pi, kiro
+                      kept by herdr-core). Agents: claude, codex, grok, agy, pi, kiro, devin, opencode
   resume              type that agent's resume command into each terminal that
                       lost its agent and sits at a shell
   status              what `resume` would do, without typing anything
@@ -44,6 +44,8 @@ AGENTS = {
     "pi": {"names": {"pi"}, "argv": lambda session: ["pi", "--session", session]},
     "kiro": {"names": {"kiro", "kiro-cli", "kiro-cli-chat"},
              "argv": lambda session: ["kiro-cli", "chat", "--v3", "--resume-id", session]},
+    "devin": {"names": {"devin", "devin.exe"}, "argv": lambda session: ["devin", "--resume", session]},
+    "opencode": {"names": {"opencode", "opencode.exe"}, "argv": lambda session: ["opencode", "--session", session]},
 }
 # Launch flags carried over to the resume command, with how many values each takes
 # ("+": one or more, up to the next flag). Only flags that set up how the agent runs
@@ -96,6 +98,16 @@ KEEP_FLAGS = {
     "kiro": {
         "--trust-all-tools": 0, "-a": 0,
         "--agent": 1, "--model": 1, "--effort": 1, "--trust-tools": 1, "--mode": 1,
+    },
+    "devin": {
+        "--sandbox": 0, "--cloud": 0, "--respect-workspace-trust": 1,
+        "--model": 1, "--permission-mode": 1, "--verbosity": 1, "--config": 1,
+        "--process-model": 1,
+    },
+    "opencode": {
+        "--pure": 0, "--print-logs": 0, "--log-level": 1,
+        "--model": 1, "-m": 1, "--agent": 1, "--variant": 1, "--port": 1,
+        "--hostname": 1, "--cors": 1,
     },
 }
 # The variable that points an agent at another config folder (a second account, say).
@@ -496,9 +508,46 @@ def is_session_event(agent, data):
     return agent == "kiro" and key == "userpromptsubmit"
 
 
+def _first_existing_dir(candidates):
+    for path in candidates:
+        if os.path.isdir(path):
+            return path
+    return candidates[-1]
+
+
+def devin_data_dir(home=None):
+    """Where the Devin CLI keeps its data (sessions.db, cli/transcripts/)."""
+    home = home or os.path.expanduser("~")
+    xdg = os.environ.get("XDG_DATA_HOME")
+    appdata = os.environ.get("APPDATA")
+    candidates = ([os.path.join(xdg, "devin")] if xdg else [])
+    if appdata:
+        candidates.append(os.path.join(appdata, "devin"))
+    candidates += [
+        os.path.join(home, ".local", "share", "devin"),
+        os.path.join(home, ".config", "devin"),
+        os.path.join(home, "Library", "Application Support", "devin"),
+    ]
+    return _first_existing_dir(candidates)
+
+
+def opencode_data_dir(home=None):
+    """Where OpenCode keeps its data (opencode.db, storage/)."""
+    home = home or os.path.expanduser("~")
+    xdg = os.environ.get("XDG_DATA_HOME")
+    candidates = ([os.path.join(xdg, "opencode")] if xdg else []) + [
+        os.path.join(home, ".local", "share", "opencode"),
+    ]
+    return _first_existing_dir(candidates)
+
+
 def default_transcript(agent, session, cwd, home=None):
     """Where this agent stores the conversation, when the hook didn't say."""
     home = home or os.path.expanduser("~")
+    if agent == "devin":
+        return os.path.join(devin_data_dir(home), "cli", "transcripts", session + ".json")
+    if agent == "opencode":
+        return os.path.join(opencode_data_dir(home), "opencode.db")
     if agent == "grok" and isinstance(cwd, str) and cwd:
         return os.path.join(home, ".grok", "sessions", quote(cwd, safe=""), session, "updates.jsonl")
     if agent == "agy":
@@ -1151,11 +1200,12 @@ def main(argv):
                 outcome = f"error: {error}"
             if outcome != "not in a Herdr terminal":
                 log("hook", agent=agent, terminal=os.environ.get("HC_TERMINAL_ID"), outcome=outcome)
-        # Antigravity reads stdout as JSON. Pi's extension reads this one line and
-        # shows it to nobody. Every other agent would treat stdout as context, so stay quiet.
+        # Antigravity reads stdout as JSON. Pi's extension and OpenCode's plugin
+        # read this one line and show it to nobody. Every other agent would treat
+        # stdout as context, so stay quiet.
         if agent == "agy":
             sys.stdout.write("{}\n")
-        elif agent == "pi":
+        elif agent in ("pi", "opencode"):
             sys.stdout.write(outcome + "\n")
         return 0
     if command_name == "watch":
